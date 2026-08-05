@@ -484,3 +484,15 @@ dmypy.json
 
 # files created by release tasks
 /release-artifacts
+
+# local build trees and fetched dependencies
+/build_det/
+/build_unit/
+/build_depcheck/
+/libs/
+/tools/
+/tmp/
+/build_fork.bat
+
+# local documentation conversion sources
+/docs/*.epub

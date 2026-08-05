@@ -284,9 +284,13 @@ Core Parameters
 
 -  ``deterministic`` :raw-html:`<a id="deterministic" title="Permalink to this parameter" href="#deterministic">&#x1F517;&#xFE0E;</a>`, default = ``false``, type = bool
 
-   -  used only with ``cpu`` device type
+   -  used with ``cpu`` and ``gpu`` device types
 
    -  setting this to ``true`` should ensure the stable results when using the same data and the same parameters (and different ``num_threads``)
+
+   -  for the ``gpu`` device type, this enables the int64 fixed-point histogram path: gradient and hessian are quantized to integers on the host, the OpenCL kernels accumulate them with 64-bit integer atomics, and the histograms are converted back on the host. With the same binary, OpenCL device, driver and runtime, repeated trainings produce byte-identical models
+
+   -  the deterministic GPU path may change the training speed and the GPU memory consumption compared to the default GPU path
 
    -  when you use the different seeds, different LightGBM versions, the binaries compiled by different compilers, or in different systems, the results are expected to be different
 
@@ -1392,6 +1396,8 @@ GPU Parameters
    -  set this to ``true`` to use double precision math on GPU (by default single precision is used)
 
    -  **Note**: can be used only in OpenCL implementation (``device_type="gpu"``), in CUDA implementation only double precision is currently supported
+
+   -  **Note**: when ``deterministic=true`` is set, the GPU histogram accumulator is always int64 fixed-point regardless of this parameter
 
 -  ``num_gpu`` :raw-html:`<a id="num_gpu" title="Permalink to this parameter" href="#num_gpu">&#x1F517;&#xFE0E;</a>`, default = ``1``, type = int, constraints: ``num_gpu > 0``
 

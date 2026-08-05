@@ -389,6 +389,18 @@ class FeatureGroup {
     return bin_data_->SizesInByte();
   }
 
+  inline size_t BinMemoryUsage() const {
+    size_t bytes = 0;
+    if (is_multi_val_) {
+      for (const auto& bin : multi_bin_data_) {
+        bytes += bin->MemoryUsage();
+      }
+    } else {
+      bytes = bin_data_->MemoryUsage();
+    }
+    return bytes;
+  }
+
   inline void* FeatureGroupData() {
     if (is_multi_val_) {
       return nullptr;

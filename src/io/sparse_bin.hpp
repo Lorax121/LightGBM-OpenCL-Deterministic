@@ -597,6 +597,9 @@ class SparseBin : public Bin {
   void* get_data() override { return nullptr; }
 
   void FinishLoad() override {
+    if (push_buffers_.empty()) {
+      return;
+    }
     // get total non zero size
     size_t pair_cnt = 0;
     for (size_t i = 0; i < push_buffers_.size(); ++i) {
@@ -620,6 +623,7 @@ class SparseBin : public Bin {
               });
     // load delta array
     LoadFromPair(idx_val_pairs);
+    ReleasePushBuffers();
   }
 
   void LoadFromPair(
@@ -699,6 +703,19 @@ class SparseBin : public Bin {
            VirtualFileWriter::AlignedSize(sizeof(VAL_T) * num_vals_);
   }
 
+  size_t MemoryUsage() const override {
+    size_t bytes = sizeof(uint8_t) * deltas_.capacity() +
+                   sizeof(VAL_T) * vals_.capacity() +
+                   sizeof(std::pair<data_size_t, data_size_t>) *
+                       fast_index_.capacity() +
+                   sizeof(std::vector<std::pair<data_size_t, VAL_T>>) *
+                       push_buffers_.capacity();
+    for (const auto& buffer : push_buffers_) {
+      bytes += sizeof(std::pair<data_size_t, VAL_T>) * buffer.capacity();
+    }
+    return bytes;
+  }
+
   void LoadFromMemory(
       const void* memory,
       const std::vector<data_size_t>& local_used_indices) override {
@@ -741,6 +758,7 @@ class SparseBin : public Bin {
       }
       LoadFromPair(tmp_pair);
     }
+    ReleasePushBuffers();
   }
 
   void CopySubrow(const Bin* full_bin, const data_size_t* used_indices,
@@ -779,6 +797,7 @@ class SparseBin : public Bin {
 
     // generate fast index
     GetFastIndex();
+    ReleasePushBuffers();
   }
 
   SparseBin<VAL_T>* Clone() override;
@@ -810,6 +829,11 @@ class SparseBin : public Bin {
   const void* GetColWiseData(uint8_t* bit_type, bool* is_sparse, BinIterator** bin_iterator) const override;
 
  private:
+  void ReleasePushBuffers() {
+    std::vector<std::vector<std::pair<data_size_t, VAL_T>>>().swap(
+        push_buffers_);
+  }
+
   data_size_t num_data_;
   std::vector<uint8_t, Common::AlignmentAllocator<uint8_t, kAlignedSize>>
       deltas_;

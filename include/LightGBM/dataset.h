@@ -841,6 +841,14 @@ class Dataset {
     return feature_groups_[group]->FeatureGroupSizesInByte();
   }
 
+  inline size_t BinMemoryUsage() const {
+    size_t bytes = 0;
+    for (const auto& group : feature_groups_) {
+      bytes += group->BinMemoryUsage();
+    }
+    return bytes;
+  }
+
   inline void* FeatureGroupData(int group) const {
     return feature_groups_[group]->FeatureGroupData();
   }

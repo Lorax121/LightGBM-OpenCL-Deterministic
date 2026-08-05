@@ -130,11 +130,13 @@ set(FMT_INCLUDE_DIR "${PROJECT_SOURCE_DIR}/external_libs/fmt/include")
 include_directories(${FMT_INCLUDE_DIR})
 
 if(BUILD_CPP_TEST AND MSVC)
-  # Use /MT flag to statically link the C runtime. Must be set before
-  # add_subdirectory(nanoarrow) so the bundled library uses the same runtime
-  # as the test executable; otherwise linking fails with unresolved __imp_*
-  # symbols (e.g. __imp_realloc).
-  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  # Use the dynamic (/MD) C runtime. The OpenCL ICD loader integration builds
+  # Boost with runtime-link=shared (/MD) and links it into the test
+  # executable; a static runtime would trigger LNK2038 mismatches. Must be set
+  # before add_subdirectory(nanoarrow) so the bundled library uses the same
+  # runtime as the test executable; otherwise linking fails with unresolved
+  # __imp_* symbols (e.g. __imp_realloc).
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
 endif()
 
 # nanoarrow is only needed by the Arrow-based C API entry points, which are
@@ -236,6 +238,10 @@ if(__INTEGRATE_OPENCL)
     else()
         include(cmake/IntegratedOpenCL.cmake)
         add_definitions(-DUSE_GPU)
+        if(WIN32)
+            # Disable Boost auto-link and link the selected libraries explicitly.
+            add_definitions(-DBOOST_ALL_NO_LIB)
+        endif()
     endif()
 endif()
 
@@ -427,9 +433,10 @@ set(
       src/treelearner/data_parallel_tree_learner.cpp
       src/treelearner/feature_histogram.cpp
       src/treelearner/feature_parallel_tree_learner.cpp
-      src/treelearner/gpu_tree_learner.cpp
-      src/treelearner/gradient_discretizer.cpp
-      src/treelearner/linear_tree_learner.cpp
+  src/treelearner/gpu_tree_learner.cpp
+  src/treelearner/gradient_discretizer.cpp
+  src/treelearner/gpu_histogram_quantizer.cpp
+  src/treelearner/linear_tree_learner.cpp
       src/treelearner/serial_tree_learner.cpp
       src/treelearner/tree_learner.cpp
       src/treelearner/voting_parallel_tree_learner.cpp
@@ -700,9 +707,14 @@ if(BUILD_CPP_TEST)
       tests/cpp_tests/test_byte_buffer.cpp
       tests/cpp_tests/test_chunked_array.cpp
       tests/cpp_tests/test_common.cpp
+      tests/cpp_tests/test_dense_bin.cpp
+      tests/cpp_tests/test_gpu_histogram_kernel.cpp
+      tests/cpp_tests/test_gpu_memory_plan.cpp
+      tests/cpp_tests/test_gpu_histogram_quantizer.cpp
       tests/cpp_tests/test_main.cpp
       tests/cpp_tests/test_serialize.cpp
       tests/cpp_tests/test_single_row.cpp
+      tests/cpp_tests/test_sparse_bin.cpp
       tests/cpp_tests/test_stream.cpp
       tests/cpp_tests/testutils.cpp
     )
@@ -711,6 +723,15 @@ if(BUILD_CPP_TEST)
   endif()
   add_executable(testlightgbm ${CPP_TEST_SOURCES})
   target_link_libraries(testlightgbm PRIVATE lightgbm_objs lightgbm_capi_objs nanoarrow_static GTest::GTest)
+  if(__INTEGRATE_OPENCL)
+    # the raw OpenCL kernel tests need the integrated Boost.Compute/OpenCL headers
+    target_include_directories(testlightgbm PRIVATE ${INTEGRATED_OPENCL_INCLUDES})
+  endif()
+  # googletest is built as a shared library when BUILD_SHARED_LIBS=ON (forced
+  # by IntegratedOpenCL.cmake for the OpenCL ICD loader); the test executable
+  # must then compile with dllimport so data symbols such as
+  # testing::FLAGS_gtest_death_test_style resolve against the import library.
+  target_compile_definitions(testlightgbm PRIVATE GTEST_LINKED_AS_SHARED_LIBRARY=1)
 endif()
 
 if(BUILD_CLI)

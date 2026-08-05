@@ -33,20 +33,43 @@ R""()
 
 #define LOCAL_SIZE_0 256
 #define NUM_BINS 256
-#if USE_DP_FLOAT == 1
+// deterministic int64 fixed-point histogram (gradient/hessian quantized on the host)
+#ifndef DETERMINISTIC_GPU_HIST
+#define DETERMINISTIC_GPU_HIST 0
+#endif
+#if DETERMINISTIC_GPU_HIST == 1
+#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
+typedef long acc_type;
+typedef long input_stat_type;
+typedef ulong acc_int_type;
+#define as_acc_type as_long
+#define as_acc_int_type as_ulong
+#elif USE_DP_FLOAT == 1
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 #pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
 typedef double acc_type;
+typedef float input_stat_type;
 typedef ulong acc_int_type;
 #define as_acc_type as_double
 #define as_acc_int_type as_ulong
 #else
 typedef float acc_type;
+typedef float input_stat_type;
 typedef uint acc_int_type;
 #define as_acc_type as_float
 #define as_acc_int_type as_uint
 #endif
+#if DETERMINISTIC_GPU_HIST == 1
+#if CONST_HESSIAN == 1
+// deterministic constant hessian: int64 gradient histogram (8 KiB) + uint32 count histogram (4 KiB)
+#define LOCAL_MEM_SIZE (4 * (sizeof(long) + sizeof(uint)) * NUM_BINS)
+#else
+// deterministic variable hessian: int64 gradient + int64 hessian histograms (16 KiB)
+#define LOCAL_MEM_SIZE (4 * 2 * sizeof(long) * NUM_BINS)
+#endif
+#else
 #define LOCAL_MEM_SIZE (4 * (sizeof(uint) + 2 * sizeof(acc_type)) * NUM_BINS)
+#endif
 
 // unroll the atomic operation for a few times. Takes more code space,
 // but compiler can generate better code for faster atomics.
@@ -130,6 +153,30 @@ inline void atomic_local_add_f(__local acc_type *addr, const float val)
         ;
 #endif
 }
+
+#if DETERMINISTIC_GPU_HIST == 1
+// deterministic int64 local atomic using the native atom_add from cl_khr_int64_base_atomics.
+// NO CAS loop over a floating-point representation - integer addition is order-independent,
+// which is what makes the deterministic histogram reproducible.
+inline void atomic_local_add_i64(__local volatile long* addr, long value) {
+    atom_add(addr, value);
+}
+// dispatch macros so the histogram accumulation sites are identical in both modes
+#define HIST_ATOMIC_ADD(addr, val) atomic_local_add_i64((addr), (val))
+// deterministic constant hessian uses a grad-only layout (4 slots per bin), the
+// variable-hessian and float layouts use 8 slots per bin (4 grad + 4 hess)
+#if CONST_HESSIAN == 1
+#define HIST_BIN_ADDR(bin, ihf, off) ((bin) * 4 + (off))
+#define HIST_BIN_ADDR2(bin, ihf, off) ((int)-1)  // never used in this mode
+#else
+#define HIST_BIN_ADDR(bin, ihf, off) ((bin) * 8 + (ihf) * 4 + (off))
+#define HIST_BIN_ADDR2(bin, ihf, off) ((bin) * 8 + (ihf) * 4 + (off) + 4 - 8 * (ihf))
+#endif
+#else
+#define HIST_ATOMIC_ADD(addr, val) atomic_local_add_f((addr), (val))
+#define HIST_BIN_ADDR(bin, ihf, off) ((bin) * 8 + (ihf) * 4 + (off))
+#define HIST_BIN_ADDR2(bin, ihf, off) ((bin) * 8 + (ihf) * 4 + (off) + 4 - 8 * (ihf))
+#endif
 
 /* Makes MSVC happy with long string literal
 )""
@@ -313,6 +360,192 @@ void within_kernel_reduction256x4(uchar4 feature_mask,
 )""
 R""()
 */
+#if DETERMINISTIC_GPU_HIST == 1
+// deterministic int64 inter-workgroup reduction.
+// All subhistograms are int64; addition is order-independent, so the traversal
+// order (which is kept identical to the float path) cannot affect the result.
+// Constant hessian: the own-workgroup hessians are computed from the count
+// histogram and the quantized constant hessian (int64 multiply, NOT uint32).
+void within_kernel_reduction256x4_det(uchar4 feature_mask,
+                               __global const long* restrict feature4_sub_hist,
+                               const uint skip_id,
+                               const ushort num_sub_hist,
+                               __global long* restrict output_buf,
+                               __local long* restrict local_hist,
+                               const long quantized_const_hessian) {
+    const ushort ltid = get_local_id(0);
+    const ushort lsize = LOCAL_SIZE_0;
+    long f0_grad_bin, f1_grad_bin, f2_grad_bin, f3_grad_bin;
+    long f0_hess_bin, f1_hess_bin, f2_hess_bin, f3_hess_bin;
+#if CONST_HESSIAN == 1
+    // deterministic constant hessian local layout: grad-only slots (4 per bin),
+    // hessians are computed from the count histogram after summing the subhistograms
+    f0_grad_bin = local_hist[ltid * 4];
+    f1_grad_bin = local_hist[ltid * 4 + 1];
+    f2_grad_bin = local_hist[ltid * 4 + 2];
+    f3_grad_bin = local_hist[ltid * 4 + 3];
+    f0_hess_bin = 0;
+    f1_hess_bin = 0;
+    f2_hess_bin = 0;
+    f3_hess_bin = 0;
+#else
+    // deterministic variable hessian local layout: 8 slots per bin (4 grad + 4 hess)
+    f0_grad_bin = local_hist[ltid * 8];
+    f1_grad_bin = local_hist[ltid * 8 + 1];
+    f2_grad_bin = local_hist[ltid * 8 + 2];
+    f3_grad_bin = local_hist[ltid * 8 + 3];
+    f0_hess_bin = local_hist[ltid * 8 + 4];
+    f1_hess_bin = local_hist[ltid * 8 + 5];
+    f2_hess_bin = local_hist[ltid * 8 + 6];
+    f3_hess_bin = local_hist[ltid * 8 + 7];
+#endif
+    ushort i;
+#if POWER_FEATURE_WORKGROUPS != 0
+    // add all sub-histograms for 4 features
+    __global const long* restrict p = feature4_sub_hist + ltid;
+    for (i = 0; i < skip_id; ++i) {
+        if (feature_mask.s3) {
+            f0_grad_bin += *p;          p += NUM_BINS;
+            f0_hess_bin += *p;          p += NUM_BINS;
+        }
+        else {
+            p += 2 * NUM_BINS;
+        }
+        if (feature_mask.s2) {
+            f1_grad_bin += *p;          p += NUM_BINS;
+            f1_hess_bin += *p;          p += NUM_BINS;
+        }
+        else {
+            p += 2 * NUM_BINS;
+        }
+        if (feature_mask.s1) {
+            f2_grad_bin += *p;          p += NUM_BINS;
+            f2_hess_bin += *p;          p += NUM_BINS;
+        }
+        else {
+            p += 2 * NUM_BINS;
+        }
+        if (feature_mask.s0) {
+            f3_grad_bin += *p;          p += NUM_BINS;
+            f3_hess_bin += *p;          p += NUM_BINS;
+        }
+        else {
+            p += 2 * NUM_BINS;
+        }
+    }
+    // skip the counters we already have
+    p += 2 * 4 * NUM_BINS;
+    for (i = i + 1; i < num_sub_hist; ++i) {
+        if (feature_mask.s3) {
+            f0_grad_bin += *p;          p += NUM_BINS;
+            f0_hess_bin += *p;          p += NUM_BINS;
+        }
+        else {
+            p += 2 * NUM_BINS;
+        }
+        if (feature_mask.s2) {
+            f1_grad_bin += *p;          p += NUM_BINS;
+            f1_hess_bin += *p;          p += NUM_BINS;
+        }
+        else {
+            p += 2 * NUM_BINS;
+        }
+        if (feature_mask.s1) {
+            f2_grad_bin += *p;          p += NUM_BINS;
+            f2_hess_bin += *p;          p += NUM_BINS;
+        }
+        else {
+            p += 2 * NUM_BINS;
+        }
+        if (feature_mask.s0) {
+            f3_grad_bin += *p;          p += NUM_BINS;
+            f3_hess_bin += *p;          p += NUM_BINS;
+        }
+        else {
+            p += 2 * NUM_BINS;
+        }
+    }
+#endif
+#if CONST_HESSIAN == 1
+    // add our own hessians: int64(count) * quantized_const_hessian.
+    // must run before the output copy below (the two-pass copy reuses the grad region)
+    __local const uint* restrict cnt_hist = (__local const uint*)(local_hist + 4 * NUM_BINS);
+    f0_hess_bin += (long)cnt_hist[ltid * 4 + 0] * quantized_const_hessian;
+    f1_hess_bin += (long)cnt_hist[ltid * 4 + 1] * quantized_const_hessian;
+    f2_hess_bin += (long)cnt_hist[ltid * 4 + 2] * quantized_const_hessian;
+    f3_hess_bin += (long)cnt_hist[ltid * 4 + 3] * quantized_const_hessian;
+#endif
+    // now overwrite the local_hist for final reduction and output
+    barrier(CLK_LOCAL_MEM_FENCE);
+#if CONST_HESSIAN == 1
+    // constant hessian local memory is 12 KiB; the interleaved scratch needs 16 KiB,
+    // so write two features per pass (same trick as the float USE_DP_FLOAT path)
+    local_hist[0 * 2 * NUM_BINS + ltid * 2 + 0] = f3_grad_bin;
+    local_hist[0 * 2 * NUM_BINS + ltid * 2 + 1] = f3_hess_bin;
+    local_hist[1 * 2 * NUM_BINS + ltid * 2 + 0] = f2_grad_bin;
+    local_hist[1 * 2 * NUM_BINS + ltid * 2 + 1] = f2_hess_bin;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    i = ltid;
+    if (feature_mask.s0) {
+        output_buf[i] = local_hist[i];
+        output_buf[i + NUM_BINS] = local_hist[i + NUM_BINS];
+    }
+    i += 1 * 2 * NUM_BINS;
+    if (feature_mask.s1) {
+        output_buf[i] = local_hist[i];
+        output_buf[i + NUM_BINS] = local_hist[i + NUM_BINS];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    local_hist[0 * 2 * NUM_BINS + ltid * 2 + 0] = f1_grad_bin;
+    local_hist[0 * 2 * NUM_BINS + ltid * 2 + 1] = f1_hess_bin;
+    local_hist[1 * 2 * NUM_BINS + ltid * 2 + 0] = f0_grad_bin;
+    local_hist[1 * 2 * NUM_BINS + ltid * 2 + 1] = f0_hess_bin;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    i = ltid;
+    if (feature_mask.s2) {
+        output_buf[i + 2 * 2 * NUM_BINS] = local_hist[i];
+        output_buf[i + 2 * 2 * NUM_BINS + NUM_BINS] = local_hist[i + NUM_BINS];
+    }
+    i += 1 * 2 * NUM_BINS;
+    if (feature_mask.s3) {
+        output_buf[i + 2 * 2 * NUM_BINS] = local_hist[i];
+        output_buf[i + 2 * 2 * NUM_BINS + NUM_BINS] = local_hist[i + NUM_BINS];
+    }
+#else
+    // reverse the f3...f0 order to match the real order
+    local_hist[0 * 2 * NUM_BINS + ltid * 2 + 0] = f3_grad_bin;
+    local_hist[0 * 2 * NUM_BINS + ltid * 2 + 1] = f3_hess_bin;
+    local_hist[1 * 2 * NUM_BINS + ltid * 2 + 0] = f2_grad_bin;
+    local_hist[1 * 2 * NUM_BINS + ltid * 2 + 1] = f2_hess_bin;
+    local_hist[2 * 2 * NUM_BINS + ltid * 2 + 0] = f1_grad_bin;
+    local_hist[2 * 2 * NUM_BINS + ltid * 2 + 1] = f1_hess_bin;
+    local_hist[3 * 2 * NUM_BINS + ltid * 2 + 0] = f0_grad_bin;
+    local_hist[3 * 2 * NUM_BINS + ltid * 2 + 1] = f0_hess_bin;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    i = ltid;
+    if (feature_mask.s0) {
+        output_buf[i] = local_hist[i];
+        output_buf[i + NUM_BINS] = local_hist[i + NUM_BINS];
+    }
+    i += 1 * 2 * NUM_BINS;
+    if (feature_mask.s1) {
+        output_buf[i] = local_hist[i];
+        output_buf[i + NUM_BINS] = local_hist[i + NUM_BINS];
+    }
+    i += 1 * 2 * NUM_BINS;
+    if (feature_mask.s2) {
+        output_buf[i] = local_hist[i];
+        output_buf[i + NUM_BINS] = local_hist[i + NUM_BINS];
+    }
+    i += 1 * 2 * NUM_BINS;
+    if (feature_mask.s3 && i < 4 * 2 * NUM_BINS) {
+        output_buf[i] = local_hist[i];
+        output_buf[i + NUM_BINS] = local_hist[i + NUM_BINS];
+    }
+#endif
+}
+#endif  // DETERMINISTIC_GPU_HIST
+
 __attribute__((reqd_work_group_size(LOCAL_SIZE_0, 1, 1)))
 #if USE_CONSTANT_BUF == 1
 __kernel void histogram256(__global const uchar4* restrict feature_data_base,
@@ -320,30 +553,62 @@ __kernel void histogram256(__global const uchar4* restrict feature_data_base,
                       const data_size_t feature_size,
                       __constant const data_size_t* restrict data_indices __attribute__((max_constant_size(65536))),
                       const data_size_t num_data,
+#if DETERMINISTIC_GPU_HIST == 1
+                      __constant const long* restrict ordered_gradients __attribute__((max_constant_size(65536))),
+#else
                       __constant const score_t* restrict ordered_gradients __attribute__((max_constant_size(65536))),
+#endif
 #if CONST_HESSIAN == 0
+#if DETERMINISTIC_GPU_HIST == 1
+                      __constant const long* restrict ordered_hessians __attribute__((max_constant_size(65536))),
+#else
                       __constant const score_t* restrict ordered_hessians __attribute__((max_constant_size(65536))),
+#endif
+#else
+#if DETERMINISTIC_GPU_HIST == 1
+                      const long quantized_const_hessian,
 #else
                       const score_t const_hessian,
 #endif
+#endif
                       __global char* restrict output_buf,
                       __global volatile int * sync_counters,
+#if DETERMINISTIC_GPU_HIST == 1
+                      __global long* restrict hist_buf_base) {
+#else
                       __global acc_type* restrict hist_buf_base) {
+#endif
 #else
 __kernel void histogram256(__global const uchar4* feature_data_base,
                       __constant const uchar4* restrict feature_masks __attribute__((max_constant_size(65536))),
                       const data_size_t feature_size,
                       __global const data_size_t* data_indices,
                       const data_size_t num_data,
+#if DETERMINISTIC_GPU_HIST == 1
+                      __global const long*  ordered_gradients,
+#else
                       __global const score_t*  ordered_gradients,
+#endif
 #if CONST_HESSIAN == 0
+#if DETERMINISTIC_GPU_HIST == 1
+                      __global const long*  ordered_hessians,
+#else
                       __global const score_t*  ordered_hessians,
+#endif
+#else
+#if DETERMINISTIC_GPU_HIST == 1
+                      const long quantized_const_hessian,
 #else
                       const score_t const_hessian,
 #endif
+#endif
                       __global char* restrict output_buf,
                       __global volatile int * sync_counters,
+#if DETERMINISTIC_GPU_HIST == 1
+                      __global long* restrict hist_buf_base) {
+#else
                       __global acc_type* restrict hist_buf_base) {
+#endif
 #endif
     // allocate the local memory array aligned with float2, to guarantee correct alignment on NVIDIA platforms
     // otherwise a "Misaligned Address" exception may occur
@@ -354,7 +619,7 @@ __kernel void histogram256(__global const uchar4* feature_data_base,
     const ushort lsize = LOCAL_SIZE_0; // get_local_size(0);
     const ushort group_id = get_group_id(0);
 
-    // local memory per workgroup is 12 KB
+    // local memory per workgroup: float path 12 KB, deterministic var 16 KiB, deterministic const 12 KiB
     // clear local memory
     __local uint * ptr = (__local uint *) shared_array;
     for (int i = ltid; i < LOCAL_MEM_SIZE/sizeof(uint); i += lsize) {
@@ -363,14 +628,26 @@ __kernel void histogram256(__global const uchar4* feature_data_base,
     barrier(CLK_LOCAL_MEM_FENCE);
     // gradient/hessian histograms
     // assume this starts at 32 * 4 = 128-byte boundary
-    // total size: 2 * 4 * 256 * size_of(float) = 8 KB
+    // float path: total size 2 * 4 * 256 * sizeof(float) = 8 KB
+    // deterministic variable hessian: 2 * 4 * 256 * sizeof(long) = 16 KiB (int64 grad + int64 hess)
+    // deterministic constant hessian: 4 * 256 * sizeof(long) = 8 KiB (int64 grad only)
     // organization: each feature/grad/hessian is at a different bank,
     //               as independent of the feature value as possible
     __local acc_type * gh_hist = (__local acc_type *)shared_array;
     // counter histogram
     // total size: 4 * 256 * size_of(uint) = 4 KB
     #if CONST_HESSIAN == 1
+    #if DETERMINISTIC_GPU_HIST == 1
+    // deterministic const: grad-only slots (4 per bin) -> count histogram directly after
+    __local uint * cnt_hist = (__local uint *)(gh_hist + 4 * NUM_BINS);
+    #else
     __local uint * cnt_hist = (__local uint *)(gh_hist + 2 * 4 * NUM_BINS);
+    #endif
+    #endif
+    #if DETERMINISTIC_GPU_HIST == 1
+    // deterministic local counter for the last-workgroup coordination (must NOT overlap
+    // the histogram storage; the float path reuses the count region instead)
+    __local uint counter_val_local;
     #endif
 
     // thread 0, 1, 2, 3 compute histograms for gradients first
@@ -408,8 +685,8 @@ __kernel void histogram256(__global const uchar4* feature_data_base,
     // offset used to rotate feature4 vector
     ushort offset = (ltid & 0x3);
     // store gradient and hessian
-    float stat1, stat2;
-    float stat1_next, stat2_next;
+    input_stat_type stat1, stat2;
+    input_stat_type stat1_next, stat2_next;
     ushort bin, addr, addr2;
     data_size_t ind;
     data_size_t ind_next;
@@ -457,7 +734,7 @@ R""()
         #endif
         #if CONST_HESSIAN == 0
         // swap gradient and hessian for threads 4, 5, 6, 7
-        float tmp = stat1;
+        input_stat_type tmp = stat1;
         stat1 = is_hessian_first ? stat2 : stat1;
         stat2 = is_hessian_first ? tmp   : stat2;
         // stat1 = select(stat1, stat2, is_hessian_first);
@@ -472,13 +749,13 @@ R""()
             // printf("%3d (%4d): writing s3 %d %d offset %d", ltid, i, bin, feature4_prev.s3, offset);
             bin = feature4_prev.s3;
             feature4_prev.s3 = feature4.s3;
-            addr = bin * 8 + is_hessian_first * 4 + offset;
-            addr2 = addr + 4 - 8 * is_hessian_first;
-            atomic_local_add_f(gh_hist + addr, s3_stat1);
+            addr = HIST_BIN_ADDR(bin, is_hessian_first, offset);
+            addr2 = HIST_BIN_ADDR2(bin, is_hessian_first, offset);
+            HIST_ATOMIC_ADD(gh_hist + addr, s3_stat1);
             // thread 0, 1, 2, 3 now process feature 0, 1, 2, 3's gradients for example 0, 1, 2, 3
             // thread 4, 5, 6, 7 now process feature 0, 1, 2, 3's Hessians  for example 4, 5, 6, 7
             #if CONST_HESSIAN == 0
-            atomic_local_add_f(gh_hist + addr2, s3_stat2);
+            HIST_ATOMIC_ADD(gh_hist + addr2, s3_stat2);
             #endif
             // thread 0, 1, 2, 3 now process feature 0, 1, 2, 3's Hessians  for example 0, 1, 2, 3
             // thread 4, 5, 6, 7 now process feature 0, 1, 2, 3's gradients for example 4, 5, 6, 7
@@ -497,13 +774,13 @@ R""()
             // printf("%3d (%4d): writing s2 %d %d feature %d", ltid, i, bin, feature4_prev.s2, offset);
             bin = feature4_prev.s2;
             feature4_prev.s2 = feature4.s2;
-            addr = bin * 8 + is_hessian_first * 4 + offset;
-            addr2 = addr + 4 - 8 * is_hessian_first;
-            atomic_local_add_f(gh_hist + addr, s2_stat1);
+            addr = HIST_BIN_ADDR(bin, is_hessian_first, offset);
+            addr2 = HIST_BIN_ADDR2(bin, is_hessian_first, offset);
+            HIST_ATOMIC_ADD(gh_hist + addr, s2_stat1);
             // thread 0, 1, 2, 3 now process feature 1, 2, 3, 0's gradients for example 0, 1, 2, 3
             // thread 4, 5, 6, 7 now process feature 1, 2, 3, 0's Hessians  for example 4, 5, 6, 7
             #if CONST_HESSIAN == 0
-            atomic_local_add_f(gh_hist + addr2, s2_stat2);
+            HIST_ATOMIC_ADD(gh_hist + addr2, s2_stat2);
             #endif
             // thread 0, 1, 2, 3 now process feature 1, 2, 3, 0's Hessians  for example 0, 1, 2, 3
             // thread 4, 5, 6, 7 now process feature 1, 2, 3, 0's gradients for example 4, 5, 6, 7
@@ -529,13 +806,13 @@ R""()
             // printf("%3d (%4d): writing s1 %d %d feature %d", ltid, i, bin, feature4_prev.s1, offset);
             bin = feature4_prev.s1;
             feature4_prev.s1 = feature4.s1;
-            addr = bin * 8 + is_hessian_first * 4 + offset;
-            addr2 = addr + 4 - 8 * is_hessian_first;
-            atomic_local_add_f(gh_hist + addr, s1_stat1);
+            addr = HIST_BIN_ADDR(bin, is_hessian_first, offset);
+            addr2 = HIST_BIN_ADDR2(bin, is_hessian_first, offset);
+            HIST_ATOMIC_ADD(gh_hist + addr, s1_stat1);
             // thread 0, 1, 2, 3 now process feature 2, 3, 0, 1's gradients for example 0, 1, 2, 3
             // thread 4, 5, 6, 7 now process feature 2, 3, 0, 1's Hessians  for example 4, 5, 6, 7
             #if CONST_HESSIAN == 0
-            atomic_local_add_f(gh_hist + addr2, s1_stat2);
+            HIST_ATOMIC_ADD(gh_hist + addr2, s1_stat2);
             #endif
             // thread 0, 1, 2, 3 now process feature 2, 3, 0, 1's Hessians  for example 0, 1, 2, 3
             // thread 4, 5, 6, 7 now process feature 2, 3, 0, 1's gradients for example 4, 5, 6, 7
@@ -554,13 +831,13 @@ R""()
             // printf("%3d (%4d): writing s0 %d %d feature %d", ltid, i, bin, feature4_prev.s0, offset);
             bin = feature4_prev.s0;
             feature4_prev.s0 = feature4.s0;
-            addr = bin * 8 + is_hessian_first * 4 + offset;
-            addr2 = addr + 4 - 8 * is_hessian_first;
-            atomic_local_add_f(gh_hist + addr, s0_stat1);
+            addr = HIST_BIN_ADDR(bin, is_hessian_first, offset);
+            addr2 = HIST_BIN_ADDR2(bin, is_hessian_first, offset);
+            HIST_ATOMIC_ADD(gh_hist + addr, s0_stat1);
             // thread 0, 1, 2, 3 now process feature 3, 0, 1, 2's gradients for example 0, 1, 2, 3
             // thread 4, 5, 6, 7 now process feature 3, 0, 1, 2's Hessians  for example 4, 5, 6, 7
             #if CONST_HESSIAN == 0
-            atomic_local_add_f(gh_hist + addr2, s0_stat2);
+            HIST_ATOMIC_ADD(gh_hist + addr2, s0_stat2);
             #endif
             // thread 0, 1, 2, 3 now process feature 3, 0, 1, 2's Hessians  for example 0, 1, 2, 3
             // thread 4, 5, 6, 7 now process feature 3, 0, 1, 2's gradients for example 4, 5, 6, 7
@@ -611,38 +888,38 @@ R""()
 
     bin = feature4_prev.s3;
     offset = (ltid & 0x3);
-    addr = bin * 8 + is_hessian_first * 4 + offset;
-    addr2 = addr + 4 - 8 * is_hessian_first;
-    atomic_local_add_f(gh_hist + addr, s3_stat1);
+    addr = HIST_BIN_ADDR(bin, is_hessian_first, offset);
+    addr2 = HIST_BIN_ADDR2(bin, is_hessian_first, offset);
+    HIST_ATOMIC_ADD(gh_hist + addr, s3_stat1);
     #if CONST_HESSIAN == 0
-    atomic_local_add_f(gh_hist + addr2, s3_stat2);
+    HIST_ATOMIC_ADD(gh_hist + addr2, s3_stat2);
     #endif
 
     bin = feature4_prev.s2;
     offset = (offset + 1) & 0x3;
-    addr = bin * 8 + is_hessian_first * 4 + offset;
-    addr2 = addr + 4 - 8 * is_hessian_first;
-    atomic_local_add_f(gh_hist + addr, s2_stat1);
+    addr = HIST_BIN_ADDR(bin, is_hessian_first, offset);
+    addr2 = HIST_BIN_ADDR2(bin, is_hessian_first, offset);
+    HIST_ATOMIC_ADD(gh_hist + addr, s2_stat1);
     #if CONST_HESSIAN == 0
-    atomic_local_add_f(gh_hist + addr2, s2_stat2);
+    HIST_ATOMIC_ADD(gh_hist + addr2, s2_stat2);
     #endif
 
     bin = feature4_prev.s1;
     offset = (offset + 1) & 0x3;
-    addr = bin * 8 + is_hessian_first * 4 + offset;
-    addr2 = addr + 4 - 8 * is_hessian_first;
-    atomic_local_add_f(gh_hist + addr, s1_stat1);
+    addr = HIST_BIN_ADDR(bin, is_hessian_first, offset);
+    addr2 = HIST_BIN_ADDR2(bin, is_hessian_first, offset);
+    HIST_ATOMIC_ADD(gh_hist + addr, s1_stat1);
     #if CONST_HESSIAN == 0
-    atomic_local_add_f(gh_hist + addr2, s1_stat2);
+    HIST_ATOMIC_ADD(gh_hist + addr2, s1_stat2);
     #endif
 
     bin = feature4_prev.s0;
     offset = (offset + 1) & 0x3;
-    addr = bin * 8 + is_hessian_first * 4 + offset;
-    addr2 = addr + 4 - 8 * is_hessian_first;
-    atomic_local_add_f(gh_hist + addr, s0_stat1);
+    addr = HIST_BIN_ADDR(bin, is_hessian_first, offset);
+    addr2 = HIST_BIN_ADDR2(bin, is_hessian_first, offset);
+    HIST_ATOMIC_ADD(gh_hist + addr, s0_stat1);
     #if CONST_HESSIAN == 0
-    atomic_local_add_f(gh_hist + addr2, s0_stat2);
+    HIST_ATOMIC_ADD(gh_hist + addr2, s0_stat2);
     #endif
     barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -657,6 +934,11 @@ R""()
 
     #if CONST_HESSIAN == 1
     barrier(CLK_LOCAL_MEM_FENCE);
+    #if DETERMINISTIC_GPU_HIST == 1
+    // deterministic constant hessian: gradients are accumulated directly into the 4 grad
+    // slots (both thread groups write to slots 0-3), so no local merge is required.
+    // hessians are computed from the count histogram at subhistogram write time.
+    #else
     // make a final reduction
     offset = ltid & 0x3; // helps avoid LDS bank conflicts
     gh_hist[ltid * 8 + offset] += gh_hist[ltid * 8 + offset + 4];
@@ -671,6 +953,7 @@ R""()
     gh_hist[ltid * 8 + offset] += gh_hist[ltid * 8 + offset + 4];
     gh_hist[ltid * 8 + offset + 4] = const_hessian * cnt_hist[ltid * 4 + offset];
     barrier(CLK_LOCAL_MEM_FENCE);
+    #endif
     #endif
 
     // write to output
@@ -719,7 +1002,15 @@ R""()
         for (ushort i = ltid; i < 2 * NUM_BINS; i += lsize) {
             // even threads read gradients, odd threads read hessians
             // FIXME: 2-way bank conflict
+            #if DETERMINISTIC_GPU_HIST == 1 && CONST_HESSIAN == 1
+            // deterministic const: grad slots in gh_hist (4 per bin); hessians materialized
+            // from the count histogram as int64(count) * quantized_const_hessian.
+            // The grad/hess half follows the output parity (i & 1), the bin is (i >> 1)
+            acc_type value = ((i & 1) == 0) ? gh_hist[(i >> 1) * 4 + j]
+                                            : (long)cnt_hist[(i >> 1) * 4 + j] * quantized_const_hessian;
+            #else
             acc_type value = gh_hist[i * 4 + j];
+            #endif
             ptr_f[(i & 1) * NUM_BINS + (i >> 1)] = value;
         }
         ptr_f += 2 * NUM_BINS;
@@ -749,7 +1040,12 @@ R""()
     // The is done by using an global atomic counter.
     // On AMD GPUs ideally this should be done in GDS,
     // but currently there is no easy way to access it via OpenCL.
+    #if DETERMINISTIC_GPU_HIST == 1
+    // deterministic layouts leave no spare local storage for the counter
+    __local uint * counter_val = &counter_val_local;
+    #else
     __local uint * counter_val = (__local uint *)(gh_hist + 2 * 4 * NUM_BINS);;
+    #endif
     // backup the old value
     uint old_val = *counter_val;
     if (ltid == 0) {
@@ -780,8 +1076,18 @@ R""()
         uint skip_id = group_id ^ output_offset;
         // locate output histogram location for this feature4
         __global acc_type* restrict hist_buf = hist_buf_base + feature4_id * 4 * 2 * NUM_BINS;
+        #if DETERMINISTIC_GPU_HIST == 1
+        #if CONST_HESSIAN == 1
+        within_kernel_reduction256x4_det(feature_mask, feature4_subhists, skip_id, 1 << POWER_FEATURE_WORKGROUPS,
+                                         hist_buf, (__local long *)shared_array, quantized_const_hessian);
+        #else
+        within_kernel_reduction256x4_det(feature_mask, feature4_subhists, skip_id, 1 << POWER_FEATURE_WORKGROUPS,
+                                         hist_buf, (__local long *)shared_array, 0);
+        #endif
+        #else
         within_kernel_reduction256x4(feature_mask, feature4_subhists, skip_id, old_val, 1 << POWER_FEATURE_WORKGROUPS,
                                      hist_buf, (__local acc_type *)shared_array);
+        #endif
         // if (ltid == 0)
         //    printf("workgroup %d reduction done, %g %g %g %g %g %g %g %g\n", group_id, hist_buf[0], hist_buf[3*NUM_BINS], hist_buf[2*3*NUM_BINS], hist_buf[3*3*NUM_BINS], hist_buf[1], hist_buf[3*NUM_BINS+1], hist_buf[2*3*NUM_BINS+1], hist_buf[3*3*NUM_BINS+1]);
     }

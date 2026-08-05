@@ -6,12 +6,14 @@
 #ifdef USE_GPU
 
 #include "gpu_tree_learner.h"
+#include "gpu_memory_plan.hpp"
 
 #include <LightGBM/bin.h>
 #include <LightGBM/network.h>
 #include <LightGBM/utils/array_args.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <iostream>
 #include <memory>
@@ -24,8 +26,22 @@
 
 namespace LightGBM {
 
+namespace {
+
+bool HasEnvironmentVariable(const char* name) {
+#ifdef _MSC_VER
+  size_t length = 0;
+  getenv_s(&length, nullptr, 0, name);
+  return length != 0;
+#else
+  return std::getenv(name) != nullptr;
+#endif
+}
+
+}  // namespace
+
 GPUTreeLearner::GPUTreeLearner(const Config* config)
-  :SerialTreeLearner(config) {
+  :SerialTreeLearner(config), quantizer_(new GPUHistogramQuantizer()) {
   use_bagging_ = false;
   Log::Info("This is the GPU trainer!!");
 }
@@ -47,6 +63,8 @@ void GPUTreeLearner::Init(const Dataset* train_data, bool is_constant_hessian) {
   SerialTreeLearner::Init(train_data, is_constant_hessian);
   // some additional variables needed for GPU trainer
   num_feature_groups_ = train_data_->num_feature_groups();
+  // deterministic=true switches the GPU histogram path to fixed-point int64 accumulation
+  use_deterministic_ = config_->deterministic;
   // Initialize GPU buffers and kernels
   InitGPU(config_->gpu_platform_id, config_->gpu_device_id);
 }
@@ -139,9 +157,9 @@ void GPUTreeLearner::GPUHistogram(data_size_t leaf_num_data, bool use_all_featur
     // we need to refresh the kernel arguments after reallocating
     for (int i = 0; i <= kMaxLogWorkgroupsPerFeature; ++i) {
       // The only argument that needs to be changed later is num_data_
-      histogram_kernels_[i].set_arg(7, *device_subhistograms_);
-      histogram_allfeats_kernels_[i].set_arg(7, *device_subhistograms_);
-      histogram_fulldata_kernels_[i].set_arg(7, *device_subhistograms_);
+      histogram_kernels_[i].set_arg(kArgOutputBuf, *device_subhistograms_);
+      histogram_allfeats_kernels_[i].set_arg(kArgOutputBuf, *device_subhistograms_);
+      histogram_fulldata_kernels_[i].set_arg(kArgOutputBuf, *device_subhistograms_);
     }
   }
   #if GPU_DEBUG >= 4
@@ -154,9 +172,9 @@ void GPUTreeLearner::GPUHistogram(data_size_t leaf_num_data, bool use_all_featur
   // process one feature4 tuple
 
   if (use_all_features) {
-    histogram_allfeats_kernels_[exp_workgroups_per_feature].set_arg(4, leaf_num_data);
+    histogram_allfeats_kernels_[exp_workgroups_per_feature].set_arg(kArgNumData, leaf_num_data);
   } else {
-    histogram_kernels_[exp_workgroups_per_feature].set_arg(4, leaf_num_data);
+    histogram_kernels_[exp_workgroups_per_feature].set_arg(kArgNumData, leaf_num_data);
   }
   // for the root node, indices are not copied
   if (leaf_num_data != num_data_) {
@@ -228,6 +246,63 @@ void GPUTreeLearner::WaitAndGetHistograms(hist_t* histograms) {
   queue_.enqueue_unmap_buffer(device_histogram_outputs_, host_histogram_outputs_);
 }
 
+void GPUTreeLearner::WaitAndGetDeterministicHistograms(hist_t* histograms) {
+  int64_t* hist_outputs = reinterpret_cast<int64_t*>(host_histogram_outputs_);
+  // when the output is ready, the computation is done
+  histograms_wait_obj_.wait();
+  const double gradient_to_floating = quantizer_->gradient_to_floating();
+  const double hessian_to_floating = quantizer_->hessian_to_floating();
+  #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
+  for (int i = 0; i < num_dense_feature_groups_; ++i) {
+    if (!feature_masks_[i]) {
+      continue;
+    }
+    int dense_group_index = dense_feature_group_map_[i];
+    auto old_histogram_array = histograms + train_data_->GroupBinBoundary(dense_group_index) * 2;
+    int bin_size = train_data_->FeatureGroupNumBin(dense_group_index);
+    if (device_bin_mults_[i] == 1) {
+      // interleaved int64 gradient/hessian pairs, one device bin per histogram bin
+      for (int j = 0; j < bin_size; ++j) {
+        GET_GRAD(old_histogram_array, j) = static_cast<double>(hist_outputs[2 * (i * device_bin_size_ + j)]) * gradient_to_floating;
+        GET_HESS(old_histogram_array, j) = static_cast<double>(hist_outputs[2 * (i * device_bin_size_ + j) + 1]) * hessian_to_floating;
+      }
+    } else {
+      // values of this feature have been redistributed to multiple bins;
+      // sum the int64 bins first, then apply the inverse factor exactly once
+      int ind = 0;
+      for (int j = 0; j < bin_size; ++j) {
+        int64_t sum_g = 0, sum_h = 0;
+        for (int k = 0; k < device_bin_mults_[i]; ++k) {
+          sum_g += hist_outputs[2 * (i * device_bin_size_ + ind)];
+          sum_h += hist_outputs[2 * (i * device_bin_size_ + ind) + 1];
+          ind++;
+        }
+        GET_GRAD(old_histogram_array, j) = static_cast<double>(sum_g) * gradient_to_floating;
+        GET_HESS(old_histogram_array, j) = static_cast<double>(sum_h) * hessian_to_floating;
+      }
+    }
+  }
+  queue_.enqueue_unmap_buffer(device_histogram_outputs_, host_histogram_outputs_);
+}
+
+boost::compute::event GPUTreeLearner::EnqueueDeviceStatGather(data_size_t num_data) {
+  const int gather_hessians = share_state_->is_constant_hessian ? 0 : 1;
+  // OpenCL requires valid memory arguments even for the runtime-disabled branch.
+  const boost::compute::buffer& full_hessians = gather_hessians != 0
+      ? device_full_quantized_hessians_
+      : device_full_quantized_gradients_;
+  const boost::compute::buffer& ordered_hessians = gather_hessians != 0
+      ? device_quantized_hessians_
+      : device_quantized_gradients_;
+  stat_gather_kernel_.set_args(
+      device_full_quantized_gradients_, full_hessians,
+      device_data_indices_->get_buffer(), device_quantized_gradients_,
+      ordered_hessians, num_data, gather_hessians);
+  const size_t global_size =
+      (static_cast<size_t>(num_data) + 255u) & ~size_t{255u};
+  return queue_.enqueue_1d_range_kernel(stat_gather_kernel_, 0, global_size, 256);
+}
+
 void GPUTreeLearner::AllocateGPUMemory() {
   num_dense_feature_groups_ = 0;
   for (int i = 0; i < num_feature_groups_; ++i) {
@@ -249,7 +324,50 @@ void GPUTreeLearner::AllocateGPUMemory() {
     Log::Warning("GPU acceleration is disabled because no non-trivial dense features can be found");
     return;
   }
-  // allocate memory for all features (FIXME: 4 GB barrier on some devices, need to split to multiple buffers)
+  hist_bin_entry_sz_ = use_deterministic_ ? 2 * sizeof(int64_t)
+                                          : (config_->gpu_use_dp ? sizeof(hist_t) * 2 : sizeof(gpu_hist_t) * 2);
+  const GPUMemoryPlan memory_plan = MakeGPUMemoryPlan(GPUMemoryPlanInput{
+      static_cast<uint64_t>(num_data_),
+      static_cast<uint64_t>(num_dense_feature4_),
+      static_cast<uint64_t>(dword_features_),
+      static_cast<uint64_t>(device_bin_size_),
+      static_cast<uint64_t>(hist_bin_entry_sz_),
+      static_cast<uint64_t>(preallocd_max_num_wg_),
+      sizeof(score_t),
+      sizeof(data_size_t),
+      use_deterministic_,
+      share_state_->is_constant_hessian,
+      dev_.global_memory_size(),
+      dev_.max_memory_alloc_size()});
+  constexpr double kMiB = 1024.0 * 1024.0;
+  Log::Info(
+      "OpenCL host Dataset bin storage: %.1f MiB",
+      train_data_->BinMemoryUsage() / kMiB);
+  Log::Info(
+      "OpenCL in-core memory plan: %.1f MiB features + %.1f MiB working "
+      "(%.1f MiB total), %.1f MiB usable with headroom",
+      memory_plan.feature_bytes / kMiB,
+      memory_plan.device_working_bytes / kMiB,
+      memory_plan.in_core_bytes / kMiB,
+      memory_plan.usable_device_bytes / kMiB);
+  if (!memory_plan.in_core_fits_hard_limits) {
+    Log::Fatal(
+        "OpenCL in-core storage exceeds device limits (required %.1f MiB, "
+        "global memory %.1f MiB, largest allocation %.1f MiB, maximum "
+        "allocation %.1f MiB). Use device_type=cpu or reduce the dataset",
+        memory_plan.in_core_bytes / kMiB,
+        dev_.global_memory_size() / kMiB,
+        memory_plan.largest_in_core_allocation_bytes / kMiB,
+        dev_.max_memory_alloc_size() / kMiB);
+  }
+  if (!memory_plan.in_core_fits_with_headroom) {
+    Log::Warning(
+        "OpenCL in-core storage fits hard limits but exceeds the safe 75%% "
+        "VRAM budget; allocation may fail because of driver overhead or "
+        "fragmentation");
+  }
+  // In-core mode uses one contiguous feature buffer. The plan above checks
+  // both its per-allocation limit and the complete device working set.
   device_features_.reset();
   device_features_ = std::unique_ptr<boost::compute::vector<Feature4>>(new boost::compute::vector<Feature4>(static_cast<uint64_t>(num_dense_feature4_) * num_data_, ctx_));
   // unpin old buffer if necessary before destructing them
@@ -285,6 +403,20 @@ void GPUTreeLearner::AllocateGPUMemory() {
   device_hessians_ = boost::compute::buffer();  // deallocate
   device_hessians_ = boost::compute::buffer(ctx_, allocated_num_data_ * sizeof(score_t),
                       boost::compute::memory_object::read_only, nullptr);
+  if (use_deterministic_) {
+    // separate int64 device buffers for the quantized values; never reinterpret
+    // the float buffers for this purpose
+    device_quantized_gradients_ = boost::compute::buffer();  // deallocate
+    device_quantized_gradients_ = boost::compute::buffer(ctx_, allocated_num_data_ * sizeof(int64_t),
+                        boost::compute::memory_object::read_only, nullptr);
+    device_quantized_hessians_ = boost::compute::buffer();  // deallocate
+    device_quantized_hessians_ = boost::compute::buffer(ctx_, allocated_num_data_ * sizeof(int64_t),
+                        boost::compute::memory_object::read_only, nullptr);
+    quantized_gradients_.reserve(allocated_num_data_);
+    quantized_hessians_.reserve(allocated_num_data_);
+    ordered_quantized_gradients_.reserve(allocated_num_data_);
+    ordered_quantized_hessians_.reserve(allocated_num_data_);
+  }
   // allocate feature mask, for disabling some feature-groups' histogram calculation
   feature_masks_.resize(num_dense_feature4_ * dword_features_);
   device_feature_masks_ = boost::compute::buffer();  // deallocate
@@ -300,8 +432,8 @@ void GPUTreeLearner::AllocateGPUMemory() {
   device_data_indices_.reset();
   device_data_indices_ = std::unique_ptr<boost::compute::vector<data_size_t>>(new boost::compute::vector<data_size_t>(allocated_num_data_, ctx_));
   boost::compute::fill(device_data_indices_->begin(), device_data_indices_->end(), 0, queue_);
-  // histogram bin entry size depends on the precision (single/double)
-  hist_bin_entry_sz_ = config_->gpu_use_dp ? sizeof(hist_t) * 2 : sizeof(gpu_hist_t) * 2;
+  // histogram bin entry size depends on the precision (single/double), or on the
+  // deterministic fixed-point representation (int64 gradient + int64 hessian)
   Log::Info("Size of histogram bin entry: %d", hist_bin_entry_sz_);
   // create output buffer, each feature has a histogram with device_bin_size_ bins,
   // each work group generates a sub-histogram of dword_features_ features.
@@ -528,6 +660,52 @@ void GPUTreeLearner::AllocateGPUMemory() {
   Log::Info("%d dense feature groups (%.2f MB) transferred to GPU in %f secs. %d sparse feature groups",
             dense_feature_group_map_.size(), ((dense_feature_group_map_.size() + (dword_features_ - 1)) / dword_features_) * num_data_ * sizeof(Feature4) / (1024.0 * 1024.0),
             end_time * 1e-3, sparse_feature_group_map_.size());
+  const bool force_device_stat_gather =
+      HasEnvironmentVariable("LGBM_ENABLE_DEVICE_STAT_GATHER");
+  const bool disable_device_stat_gather =
+      HasEnvironmentVariable("LGBM_DISABLE_DEVICE_STAT_GATHER");
+  // The crossover measured on the RX 480 lies between 1M and 5M rows. Keep
+  // automatic activation conservative and retain explicit A/B switches. The
+  // automatic path also leaves 25% of reported VRAM for driver/runtime storage.
+  const bool memory_allows_device_stat_gather =
+      memory_plan.stat_gather_fits_with_headroom;
+  use_device_stat_gather_ =
+      use_deterministic_ && sparse_feature_group_map_.empty() &&
+      !disable_device_stat_gather &&
+      (force_device_stat_gather ||
+       (num_data_ >= 4000000 && memory_allows_device_stat_gather));
+  if (use_device_stat_gather_) {
+    try {
+      device_full_quantized_gradients_ = boost::compute::buffer(
+          ctx_, num_data_ * sizeof(int64_t),
+          boost::compute::memory_object::read_only, nullptr);
+      if (!share_state_->is_constant_hessian) {
+        device_full_quantized_hessians_ = boost::compute::buffer(
+            ctx_, num_data_ * sizeof(int64_t),
+            boost::compute::memory_object::read_only, nullptr);
+      } else {
+        device_full_quantized_hessians_ = device_full_quantized_gradients_;
+      }
+    } catch (const boost::compute::opencl_error& e) {
+      device_full_quantized_gradients_ = boost::compute::buffer();
+      device_full_quantized_hessians_ = boost::compute::buffer();
+      use_device_stat_gather_ = false;
+      if (force_device_stat_gather) {
+        Log::Fatal("Cannot allocate forced OpenCL device stat gather buffers: %s", e.what());
+      }
+      Log::Warning("OpenCL device stat gather disabled after buffer allocation failed: %s", e.what());
+    }
+    if (use_device_stat_gather_) {
+      Log::Info("Exact OpenCL device stat gather enabled");
+    }
+  } else {
+    device_full_quantized_gradients_ = boost::compute::buffer();
+    device_full_quantized_hessians_ = boost::compute::buffer();
+    if (use_deterministic_ && num_data_ >= 4000000 &&
+        !memory_allows_device_stat_gather && !force_device_stat_gather) {
+      Log::Info("Exact OpenCL device stat gather disabled to preserve VRAM headroom");
+    }
+  }
   #if GPU_DEBUG >= 1
   printf("Dense feature group list (size %lu): ", dense_feature_group_map_.size());
   for (int i = 0; i < num_dense_feature_groups_; ++i) {
@@ -586,8 +764,14 @@ void GPUTreeLearner::BuildGPUKernels() {
     // compile the GPU kernel depending if double precision is used, constant hessian is used, etc.
     opts << " -D POWER_FEATURE_WORKGROUPS=" << i
          << " -D USE_CONSTANT_BUF=" << use_constants << " -D USE_DP_FLOAT=" << int(config_->gpu_use_dp)
-         << " -D CONST_HESSIAN=" << int(share_state_->is_constant_hessian)
-         << " -cl-mad-enable -cl-no-signed-zeros -cl-fast-relaxed-math";
+         << " -D CONST_HESSIAN=" << int(share_state_->is_constant_hessian);
+    if (use_deterministic_) {
+      // deterministic fixed-point kernels accumulate int64 values only; the fast-math
+      // flags are deliberately omitted so no hidden floating-point operation can sneak in
+      opts << " -D DETERMINISTIC_GPU_HIST=1";
+    } else {
+      opts << " -cl-mad-enable -cl-no-signed-zeros -cl-fast-relaxed-math";
+    }
     #if GPU_DEBUG >= 1
     std::cout << "Building GPU kernels with options: " << opts.str() << std::endl;
     #endif
@@ -634,9 +818,34 @@ void GPUTreeLearner::BuildGPUKernels() {
       }
     }
     histogram_fulldata_kernels_[i] = program.create_kernel(kernel_name_);
+    if (use_deterministic_) {
+      // verify that the compiled kernel fits into the device local memory (the actual
+      // requirement can exceed the simple 12/16 KiB estimate because of alignment)
+      const size_t kernel_local_mem = histogram_kernels_[i].get_work_group_info<size_t>(dev_, CL_KERNEL_LOCAL_MEM_SIZE);
+      const size_t device_local_mem = dev_.get_info<size_t>(CL_DEVICE_LOCAL_MEM_SIZE);
+      if (kernel_local_mem > device_local_mem) {
+        Log::Fatal("Deterministic kernel %s (2^%d workgroups per feature) requires %lu bytes of local memory, "
+                   "but device %s only has %lu bytes",
+                   kernel_name_.c_str(), i, kernel_local_mem, dev_.name().c_str(), device_local_mem);
+      }
+    }
     OMP_LOOP_EX_END();
   }
   OMP_THROW_EX();
+  if (use_deterministic_) {
+    boost::compute::program gather_program =
+        boost::compute::program::create_with_source(
+            kernel_stat_gather_src_ + 9, ctx_);
+    try {
+      gather_program.build();
+      stat_gather_kernel_ =
+          gather_program.create_kernel("gather_ordered_stats_i64");
+    } catch (boost::compute::opencl_error &e) {
+      std::cerr << "Fixed-point stat gather build log:" << std::endl
+                << gather_program.build_log() << std::endl;
+      Log::Fatal("Cannot build fixed-point stat gather kernel: %s", e.what());
+    }
+  }
   Log::Info("GPU programs have been built");
 }
 
@@ -645,30 +854,62 @@ void GPUTreeLearner::SetupKernelArguments() {
   if (!num_dense_feature_groups_) {
     return;
   }
+  const boost::compute::buffer& full_quantized_gradients =
+      use_device_stat_gather_ ? device_full_quantized_gradients_
+                              : device_quantized_gradients_;
+  const boost::compute::buffer& full_quantized_hessians =
+      use_device_stat_gather_ ? device_full_quantized_hessians_
+                              : device_quantized_hessians_;
   for (int i = 0; i <= kMaxLogWorkgroupsPerFeature; ++i) {
     // The only argument that needs to be changed later is num_data_
     if (share_state_->is_constant_hessian) {
       // hessian is passed as a parameter, but it is not available now.
       // hessian will be set in BeforeTrain()
-      histogram_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
-                                         *device_data_indices_, num_data_, device_gradients_, 0.0f,
-                                         *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
-      histogram_allfeats_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
-                                         *device_data_indices_, num_data_, device_gradients_, 0.0f,
-                                         *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
-      histogram_fulldata_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
-                                          *device_data_indices_, num_data_, device_gradients_, 0.0f,
-                                          *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
+      if (use_deterministic_) {
+        // deterministic kernels take the quantized (int64) gradients and the
+        // quantized constant hessian; the value is replaced in BeforeTrain()
+        histogram_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
+                                           *device_data_indices_, num_data_, device_quantized_gradients_, quantized_const_hessian_,
+                                           *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
+        histogram_allfeats_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
+                                           *device_data_indices_, num_data_, device_quantized_gradients_, quantized_const_hessian_,
+                                           *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
+        histogram_fulldata_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
+                                            *device_data_indices_, num_data_, full_quantized_gradients, quantized_const_hessian_,
+                                            *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
+      } else {
+        histogram_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
+                                           *device_data_indices_, num_data_, device_gradients_, 0.0f,
+                                           *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
+        histogram_allfeats_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
+                                           *device_data_indices_, num_data_, device_gradients_, 0.0f,
+                                           *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
+        histogram_fulldata_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
+                                            *device_data_indices_, num_data_, device_gradients_, 0.0f,
+                                            *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
+      }
     } else {
-      histogram_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
-                                         *device_data_indices_, num_data_, device_gradients_, device_hessians_,
-                                         *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
-      histogram_allfeats_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
-                                         *device_data_indices_, num_data_, device_gradients_, device_hessians_,
-                                         *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
-      histogram_fulldata_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
-                                          *device_data_indices_, num_data_, device_gradients_, device_hessians_,
-                                          *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
+      if (use_deterministic_) {
+        histogram_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
+                                           *device_data_indices_, num_data_, device_quantized_gradients_, device_quantized_hessians_,
+                                           *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
+        histogram_allfeats_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
+                                           *device_data_indices_, num_data_, device_quantized_gradients_, device_quantized_hessians_,
+                                           *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
+        histogram_fulldata_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
+                                            *device_data_indices_, num_data_, full_quantized_gradients, full_quantized_hessians,
+                                            *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
+      } else {
+        histogram_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
+                                           *device_data_indices_, num_data_, device_gradients_, device_hessians_,
+                                           *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
+        histogram_allfeats_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
+                                           *device_data_indices_, num_data_, device_gradients_, device_hessians_,
+                                           *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
+        histogram_fulldata_kernels_[i].set_args(*device_features_, device_feature_masks_, num_data_,
+                                            *device_data_indices_, num_data_, device_gradients_, device_hessians_,
+                                            *device_subhistograms_, *sync_counters_, device_histogram_outputs_);
+      }
     }
   }
 }
@@ -754,6 +995,25 @@ void GPUTreeLearner::InitGPU(int platform_id, int device_id) {
   ctx_ = boost::compute::context(dev_);
   queue_ = boost::compute::command_queue(ctx_, dev_);
   Log::Info("Using GPU Device: %s, Vendor: %s", dev_.name().c_str(), dev_.vendor().c_str());
+  if (use_deterministic_) {
+    // deterministic GPU histograms rely on native 64-bit integer local atomics,
+    // a deterministic local memory layout and a little-endian host/device pair
+    if (!dev_.supports_extension("cl_khr_int64_base_atomics")) {
+      Log::Fatal("GPU device %s does not support cl_khr_int64_base_atomics, which is required for deterministic=true training",
+                 dev_.name().c_str());
+    }
+    const size_t device_local_mem = dev_.get_info<size_t>(CL_DEVICE_LOCAL_MEM_SIZE);
+    // deterministic kernels need 16 KiB (variable hessian) or 12 KiB (constant hessian) of local memory
+    const size_t required_local_mem = share_state_->is_constant_hessian ? 12288 : 16384;
+    if (device_local_mem < required_local_mem) {
+      Log::Fatal("GPU device %s only has %lu bytes of local memory, but deterministic training requires at least %lu bytes",
+                 dev_.name().c_str(), device_local_mem, required_local_mem);
+    }
+    if (!dev_.get_info<cl_bool>(CL_DEVICE_ENDIAN_LITTLE)) {
+      Log::Fatal("GPU device %s is big-endian, but deterministic training requires a little-endian device",
+                 dev_.name().c_str());
+    }
+  }
   BuildGPUKernels();
   AllocateGPUMemory();
   // setup GPU kernel arguments after we allocating all the buffers
@@ -761,6 +1021,7 @@ void GPUTreeLearner::InitGPU(int platform_id, int device_id) {
 }
 
 Tree* GPUTreeLearner::Train(const score_t* gradients, const score_t *hessians, bool is_first_tree) {
+  ++training_iteration_;
   return SerialTreeLearner::Train(gradients, hessians, is_first_tree);
 }
 
@@ -777,6 +1038,17 @@ void GPUTreeLearner::ResetIsConstantHessian(bool is_constant_hessian) {
   if (is_constant_hessian != share_state_->is_constant_hessian) {
     SerialTreeLearner::ResetIsConstantHessian(is_constant_hessian);
     BuildGPUKernels();
+    // Only the optional full Hessian buffer depends on the objective mode;
+    // repacking and retransferring the feature matrix here would be wasteful.
+    if (use_device_stat_gather_) {
+      if (share_state_->is_constant_hessian) {
+        device_full_quantized_hessians_ = device_full_quantized_gradients_;
+      } else {
+        device_full_quantized_hessians_ = boost::compute::buffer(
+            ctx_, num_data_ * sizeof(int64_t),
+            boost::compute::memory_object::read_only, nullptr);
+      }
+    }
     SetupKernelArguments();
   }
 }
@@ -785,22 +1057,54 @@ void GPUTreeLearner::BeforeTrain() {
   #if GPU_DEBUG >= 2
   printf("Copying initial full gradients and hessians to device\n");
   #endif
+  if (use_deterministic_ && num_dense_feature_groups_) {
+    // deterministic path: compute the quantizer state over the FULL dataset and quantize
+    // the full arrays exactly once per boosting iteration. One quantizer state is used
+    // for the whole tree; it is never recomputed for bagged roots or child leaves.
+    quantizer_->ComputeState(num_data_, gradients_, hessians_, share_state_->is_constant_hessian, training_iteration_);
+    quantizer_->QuantizeGradients(gradients_, quantized_gradients_.data(), num_data_);
+    if (!share_state_->is_constant_hessian) {
+      quantizer_->QuantizeHessians(hessians_, quantized_hessians_.data(), num_data_);
+    } else {
+      quantized_const_hessian_ = quantizer_->QuantizeConstHessian(hessians_[0], training_iteration_);
+    }
+  }
   // Copy initial full hessians and gradients to GPU.
   // We start copying as early as possible, instead of at ConstructHistogram().
-  if (!use_bagging_ && num_dense_feature_groups_) {
+  if (num_dense_feature_groups_ && (!use_bagging_ || use_device_stat_gather_)) {
     if (!share_state_->is_constant_hessian) {
-      hessians_future_ = queue_.enqueue_write_buffer_async(device_hessians_, 0, num_data_ * sizeof(score_t), hessians_);
+      if (use_deterministic_) {
+        hessians_future_ = queue_.enqueue_write_buffer_async(
+            use_device_stat_gather_ ? device_full_quantized_hessians_
+                                    : device_quantized_hessians_,
+            0, num_data_ * sizeof(int64_t), quantized_hessians_.data());
+      } else {
+        hessians_future_ = queue_.enqueue_write_buffer_async(device_hessians_, 0, num_data_ * sizeof(score_t), hessians_);
+      }
     } else {
       // setup hessian parameters only
-      score_t const_hessian = hessians_[0];
       for (int i = 0; i <= kMaxLogWorkgroupsPerFeature; ++i) {
         // hessian is passed as a parameter
-        histogram_kernels_[i].set_arg(6, const_hessian);
-        histogram_allfeats_kernels_[i].set_arg(6, const_hessian);
-        histogram_fulldata_kernels_[i].set_arg(6, const_hessian);
+        if (use_deterministic_) {
+          histogram_kernels_[i].set_arg(kArgOrderedHessiansOrConstHessian, quantized_const_hessian_);
+          histogram_allfeats_kernels_[i].set_arg(kArgOrderedHessiansOrConstHessian, quantized_const_hessian_);
+          histogram_fulldata_kernels_[i].set_arg(kArgOrderedHessiansOrConstHessian, quantized_const_hessian_);
+        } else {
+          score_t const_hessian = hessians_[0];
+          histogram_kernels_[i].set_arg(kArgOrderedHessiansOrConstHessian, const_hessian);
+          histogram_allfeats_kernels_[i].set_arg(kArgOrderedHessiansOrConstHessian, const_hessian);
+          histogram_fulldata_kernels_[i].set_arg(kArgOrderedHessiansOrConstHessian, const_hessian);
+        }
       }
     }
-    gradients_future_ = queue_.enqueue_write_buffer_async(device_gradients_, 0, num_data_ * sizeof(score_t), gradients_);
+    if (use_deterministic_) {
+      gradients_future_ = queue_.enqueue_write_buffer_async(
+          use_device_stat_gather_ ? device_full_quantized_gradients_
+                                  : device_quantized_gradients_,
+          0, num_data_ * sizeof(int64_t), quantized_gradients_.data());
+    } else {
+      gradients_future_ = queue_.enqueue_write_buffer_async(device_gradients_, 0, num_data_ * sizeof(score_t), gradients_);
+    }
   }
 
   SerialTreeLearner::BeforeTrain();
@@ -816,29 +1120,61 @@ void GPUTreeLearner::BeforeTrain() {
     #endif
     // transfer the indices to GPU
     indices_future_ = boost::compute::copy_async(indices, indices + cnt, device_data_indices_->begin(), queue_);
-    if (!share_state_->is_constant_hessian) {
+    if (use_device_stat_gather_) {
+      gradients_future_ = EnqueueDeviceStatGather(cnt);
+      if (!share_state_->is_constant_hessian) {
+        hessians_future_ = gradients_future_;
+      }
+    } else if (!share_state_->is_constant_hessian) {
       #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
       for (data_size_t i = 0; i < cnt; ++i) {
         ordered_hessians_[i] = hessians_[indices[i]];
       }
-      // transfer hessian to GPU
-      hessians_future_ = queue_.enqueue_write_buffer_async(device_hessians_, 0, cnt * sizeof(score_t), ordered_hessians_.data());
+      if (use_deterministic_) {
+        // gather the ordered int64 values from the already-quantized full arrays
+        #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
+        for (data_size_t i = 0; i < cnt; ++i) {
+          ordered_quantized_hessians_[i] = quantized_hessians_[indices[i]];
+        }
+        // transfer hessian to GPU
+        hessians_future_ = queue_.enqueue_write_buffer_async(device_quantized_hessians_, 0, cnt * sizeof(int64_t), ordered_quantized_hessians_.data());
+      } else {
+        // transfer hessian to GPU
+        hessians_future_ = queue_.enqueue_write_buffer_async(device_hessians_, 0, cnt * sizeof(score_t), ordered_hessians_.data());
+      }
     } else {
       // setup hessian parameters only
-      score_t const_hessian = hessians_[indices[0]];
       for (int i = 0; i <= kMaxLogWorkgroupsPerFeature; ++i) {
         // hessian is passed as a parameter
-        histogram_kernels_[i].set_arg(6, const_hessian);
-        histogram_allfeats_kernels_[i].set_arg(6, const_hessian);
-        histogram_fulldata_kernels_[i].set_arg(6, const_hessian);
+        if (use_deterministic_) {
+          histogram_kernels_[i].set_arg(kArgOrderedHessiansOrConstHessian, quantized_const_hessian_);
+          histogram_allfeats_kernels_[i].set_arg(kArgOrderedHessiansOrConstHessian, quantized_const_hessian_);
+          histogram_fulldata_kernels_[i].set_arg(kArgOrderedHessiansOrConstHessian, quantized_const_hessian_);
+        } else {
+          score_t const_hessian = hessians_[indices[0]];
+          histogram_kernels_[i].set_arg(kArgOrderedHessiansOrConstHessian, const_hessian);
+          histogram_allfeats_kernels_[i].set_arg(kArgOrderedHessiansOrConstHessian, const_hessian);
+          histogram_fulldata_kernels_[i].set_arg(kArgOrderedHessiansOrConstHessian, const_hessian);
+        }
       }
     }
-    #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
-    for (data_size_t i = 0; i < cnt; ++i) {
-      ordered_gradients_[i] = gradients_[indices[i]];
+    if (!use_device_stat_gather_) {
+      #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
+      for (data_size_t i = 0; i < cnt; ++i) {
+        ordered_gradients_[i] = gradients_[indices[i]];
+      }
+      if (use_deterministic_) {
+        #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
+        for (data_size_t i = 0; i < cnt; ++i) {
+          ordered_quantized_gradients_[i] = quantized_gradients_[indices[i]];
+        }
+        // transfer gradients to GPU
+        gradients_future_ = queue_.enqueue_write_buffer_async(device_quantized_gradients_, 0, cnt * sizeof(int64_t), ordered_quantized_gradients_.data());
+      } else {
+        // transfer gradients to GPU
+        gradients_future_ = queue_.enqueue_write_buffer_async(device_gradients_, 0, cnt * sizeof(score_t), ordered_gradients_.data());
+      }
     }
-    // transfer gradients to GPU
-    gradients_future_ = queue_.enqueue_write_buffer_async(device_gradients_, 0, cnt * sizeof(score_t), ordered_gradients_.data());
   }
 }
 
@@ -870,21 +1206,48 @@ bool GPUTreeLearner::BeforeFindBestSplit(const Tree* tree, int left_leaf, int ri
     #endif
     indices_future_ = boost::compute::copy_async(indices + begin, indices + end, device_data_indices_->begin(), queue_);
 
-    if (!share_state_->is_constant_hessian) {
+    if (use_device_stat_gather_) {
+      gradients_future_ = EnqueueDeviceStatGather(end - begin);
+      if (!share_state_->is_constant_hessian) {
+        hessians_future_ = gradients_future_;
+      }
+    } else if (!share_state_->is_constant_hessian) {
       #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
       for (data_size_t i = begin; i < end; ++i) {
         ordered_hessians_[i - begin] = hessians_[indices[i]];
       }
-      // copy ordered Hessians to the GPU:
-      hessians_future_ = queue_.enqueue_write_buffer_async(device_hessians_, 0, (end - begin) * sizeof(score_t), ptr_pinned_hessians_);
+      if (use_deterministic_) {
+        // gather the ordered int64 values from the already-quantized full arrays
+        #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
+        for (data_size_t i = begin; i < end; ++i) {
+          ordered_quantized_hessians_[i - begin] = quantized_hessians_[indices[i]];
+        }
+        // copy ordered Hessians to the GPU:
+        hessians_future_ = queue_.enqueue_write_buffer_async(device_quantized_hessians_, 0, (end - begin) * sizeof(int64_t), ordered_quantized_hessians_.data());
+      } else {
+        // copy ordered Hessians to the GPU:
+        hessians_future_ = queue_.enqueue_write_buffer_async(device_hessians_, 0, (end - begin) * sizeof(score_t), ptr_pinned_hessians_);
+      }
     }
 
-    #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
-    for (data_size_t i = begin; i < end; ++i) {
-      ordered_gradients_[i - begin] = gradients_[indices[i]];
+    if (!use_device_stat_gather_) {
+      #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
+      for (data_size_t i = begin; i < end; ++i) {
+        ordered_gradients_[i - begin] = gradients_[indices[i]];
+      }
+      if (use_deterministic_) {
+        // gather the ordered int64 values from the already-quantized full arrays
+        #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
+        for (data_size_t i = begin; i < end; ++i) {
+          ordered_quantized_gradients_[i - begin] = quantized_gradients_[indices[i]];
+        }
+        // copy ordered gradients to the GPU:
+        gradients_future_ = queue_.enqueue_write_buffer_async(device_quantized_gradients_, 0, (end - begin) * sizeof(int64_t), ordered_quantized_gradients_.data());
+      } else {
+        // copy ordered gradients to the GPU:
+        gradients_future_ = queue_.enqueue_write_buffer_async(device_gradients_, 0, (end - begin) * sizeof(score_t), ptr_pinned_gradients_);
+      }
     }
-    // copy ordered gradients to the GPU:
-    gradients_future_ = queue_.enqueue_write_buffer_async(device_gradients_, 0, (end - begin) * sizeof(score_t), ptr_pinned_gradients_);
 
     #if GPU_DEBUG >= 2
     Log::Info("Gradients/Hessians/indices copied to device with size %d", end - begin);
@@ -910,28 +1273,61 @@ bool GPUTreeLearner::ConstructGPUHistogramsAsync(
   if (data_indices != nullptr && num_data != num_data_) {
     indices_future_ = boost::compute::copy_async(data_indices, data_indices + num_data, device_data_indices_->begin(), queue_);
   }
+  if (use_device_stat_gather_ && gradients != nullptr && num_data != num_data_) {
+    gradients_future_ = EnqueueDeviceStatGather(num_data);
+    if (!share_state_->is_constant_hessian) {
+      hessians_future_ = gradients_future_;
+    }
+  }
   // generate and copy ordered_gradients if gradients is not null
-  if (gradients != nullptr) {
+  if (gradients != nullptr && !use_device_stat_gather_) {
     if (num_data != num_data_) {
       #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
       for (data_size_t i = 0; i < num_data; ++i) {
         ordered_gradients[i] = gradients[data_indices[i]];
       }
-      gradients_future_ = queue_.enqueue_write_buffer_async(device_gradients_, 0, num_data * sizeof(score_t), ptr_pinned_gradients_);
+      if (use_deterministic_) {
+        // deterministic path never re-quantizes: ordered int64 values are gathered
+        // from the quantized full arrays (same scale for the whole tree)
+        #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
+        for (data_size_t i = 0; i < num_data; ++i) {
+          ordered_quantized_gradients_[i] = quantized_gradients_[data_indices[i]];
+        }
+        gradients_future_ = queue_.enqueue_write_buffer_async(device_quantized_gradients_, 0, num_data * sizeof(int64_t), ordered_quantized_gradients_.data());
+      } else {
+        gradients_future_ = queue_.enqueue_write_buffer_async(device_gradients_, 0, num_data * sizeof(score_t), ptr_pinned_gradients_);
+      }
     } else {
-      gradients_future_ = queue_.enqueue_write_buffer_async(device_gradients_, 0, num_data * sizeof(score_t), gradients);
+      if (use_deterministic_) {
+        gradients_future_ = queue_.enqueue_write_buffer_async(device_quantized_gradients_, 0, num_data * sizeof(int64_t), quantized_gradients_.data());
+      } else {
+        gradients_future_ = queue_.enqueue_write_buffer_async(device_gradients_, 0, num_data * sizeof(score_t), gradients);
+      }
     }
   }
   // generate and copy ordered_hessians if Hessians is not null
-  if (hessians != nullptr && !share_state_->is_constant_hessian) {
+  if (hessians != nullptr && !share_state_->is_constant_hessian &&
+      !use_device_stat_gather_) {
     if (num_data != num_data_) {
       #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
       for (data_size_t i = 0; i < num_data; ++i) {
         ordered_hessians[i] = hessians[data_indices[i]];
       }
-      hessians_future_ = queue_.enqueue_write_buffer_async(device_hessians_, 0, num_data * sizeof(score_t), ptr_pinned_hessians_);
+      if (use_deterministic_) {
+        #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
+        for (data_size_t i = 0; i < num_data; ++i) {
+          ordered_quantized_hessians_[i] = quantized_hessians_[data_indices[i]];
+        }
+        hessians_future_ = queue_.enqueue_write_buffer_async(device_quantized_hessians_, 0, num_data * sizeof(int64_t), ordered_quantized_hessians_.data());
+      } else {
+        hessians_future_ = queue_.enqueue_write_buffer_async(device_hessians_, 0, num_data * sizeof(score_t), ptr_pinned_hessians_);
+      }
     } else {
-      hessians_future_ = queue_.enqueue_write_buffer_async(device_hessians_, 0, num_data * sizeof(score_t), hessians);
+      if (use_deterministic_) {
+        hessians_future_ = queue_.enqueue_write_buffer_async(device_quantized_hessians_, 0, num_data * sizeof(int64_t), quantized_hessians_.data());
+      } else {
+        hessians_future_ = queue_.enqueue_write_buffer_async(device_hessians_, 0, num_data * sizeof(score_t), hessians);
+      }
     }
   }
   // converted indices in is_feature_used to feature-group indices
@@ -1005,7 +1401,10 @@ void GPUTreeLearner::ConstructHistograms(const std::vector<int8_t>& is_feature_u
     ptr_smaller_leaf_hist_data);
   // wait for GPU to finish, only if GPU is actually used
   if (is_gpu_used) {
-    if (config_->gpu_use_dp) {
+    if (use_deterministic_) {
+      // deterministic int64 histograms are dequantized with the quantizer inverse factors
+      WaitAndGetDeterministicHistograms(ptr_smaller_leaf_hist_data);
+    } else if (config_->gpu_use_dp) {
       // use double precision
       WaitAndGetHistograms<hist_t>(ptr_smaller_leaf_hist_data);
     } else {
@@ -1070,7 +1469,10 @@ void GPUTreeLearner::ConstructHistograms(const std::vector<int8_t>& is_feature_u
       ptr_larger_leaf_hist_data);
     // wait for GPU to finish, only if GPU is actually used
     if (is_gpu_used) {
-      if (config_->gpu_use_dp) {
+      if (use_deterministic_) {
+        // deterministic int64 histograms are dequantized with the quantizer inverse factors
+        WaitAndGetDeterministicHistograms(ptr_larger_leaf_hist_data);
+      } else if (config_->gpu_use_dp) {
         // use double precision
         WaitAndGetHistograms<hist_t>(ptr_larger_leaf_hist_data);
       } else {

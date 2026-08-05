@@ -21,6 +21,7 @@
 
 #include "data_partition.hpp"
 #include "feature_histogram.hpp"
+#include "gpu_histogram_quantizer.hpp"
 #include "leaf_splits.hpp"
 #include "serial_tree_learner.h"
 #include "split_info.hpp"
@@ -132,6 +133,14 @@ class GPUTreeLearner: public SerialTreeLearner {
   void WaitAndGetHistograms(hist_t* histograms);
 
   /*!
+   * \brief Wait for GPU kernel execution and read the deterministic int64 histogram,
+   *        converting the integer bins back to hist_t with the quantizer inverse factors.
+   *        Redistributed bins are summed in int64 before the single inverse scaling.
+   * \param histograms Destination of histogram results from GPU.
+  */
+  void WaitAndGetDeterministicHistograms(hist_t* histograms);
+
+  /*!
    * \brief Construct GPU histogram asynchronously.
    *        Interface is similar to Dataset::ConstructHistograms().
    * \param is_feature_used A predicate vector for enabling each feature
@@ -152,6 +161,9 @@ class GPUTreeLearner: public SerialTreeLearner {
     const score_t* gradients, const score_t* hessians,
     score_t* ordered_gradients, score_t* ordered_hessians);
 
+  /*! \brief Gather a leaf's fixed-point statistics from iteration-resident arrays. */
+  boost::compute::event EnqueueDeviceStatGather(data_size_t num_data);
+
 
   /*! brief Log2 of max number of workgroups per feature*/
   const int kMaxLogWorkgroupsPerFeature = 10;  // 2^10
@@ -161,6 +173,46 @@ class GPUTreeLearner: public SerialTreeLearner {
 
   /*! \brief True if bagging is used */
   bool use_bagging_;
+
+  /*! \brief Named kernel argument indices, kept in sync with the histogram kernel signature */
+  enum KernelArgIndex {
+    kArgFeatureDataBase = 0,
+    kArgFeatureMasks = 1,
+    kArgFeatureSize = 2,
+    kArgDataIndices = 3,
+    kArgNumData = 4,
+    kArgOrderedGradients = 5,
+    kArgOrderedHessiansOrConstHessian = 6,
+    kArgOutputBuf = 7,
+    kArgSyncCounters = 8,
+    kArgHistBufBase = 9
+  };
+
+  /*! \brief True when deterministic fixed-point (int64) GPU histograms are used */
+  bool use_deterministic_ = false;
+  /*! \brief Fixed-point quantizer for deterministic GPU histograms (pure CPU module) */
+  std::unique_ptr<GPUHistogramQuantizer> quantizer_;
+  /*! \brief Host-side quantized arrays, one value per training row */
+  std::vector<int64_t> quantized_gradients_;
+  std::vector<int64_t> quantized_hessians_;
+  /*! \brief Host-side ordered quantized arrays (gathered by data_indices for the current leaf) */
+  std::vector<int64_t> ordered_quantized_gradients_;
+  std::vector<int64_t> ordered_quantized_hessians_;
+  /*! \brief Quantized constant hessian (used only when share_state_->is_constant_hessian) */
+  int64_t quantized_const_hessian_ = 0;
+  /*! \brief Device buffers for the quantized gradient/hessian arrays (separate from the float buffers) */
+  boost::compute::buffer device_quantized_gradients_;
+  boost::compute::buffer device_quantized_hessians_;
+  /*! \brief Keep full fixed-point statistics resident for device-side leaf gathers. */
+  bool use_device_stat_gather_ = false;
+  boost::compute::buffer device_full_quantized_gradients_;
+  boost::compute::buffer device_full_quantized_hessians_;
+  const char *kernel_stat_gather_src_ = {
+  #include "ocl/stat_gather.cl"
+  };
+  boost::compute::kernel stat_gather_kernel_;
+  /*! \brief Current boosting iteration, used in quantizer error messages */
+  int training_iteration_ = 0;
 
   /*! \brief GPU device object */
   boost::compute::device dev_;

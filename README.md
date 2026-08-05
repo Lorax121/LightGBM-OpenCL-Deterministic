@@ -1,5 +1,106 @@
 <img src=https://github.com/lightgbm-org/LightGBM/blob/main/docs/logo/LightGBM_logo_black_text.svg width=300 />
 
+# About this fork
+
+This is LightGBM **4.7.0.100**, based on upstream LightGBM 4.7.0
+(`f9bf8d13`). It keeps the upstream CPU + OpenCL hybrid learner and adds:
+
+- reproducible OpenCL training: repeated fits produce byte-identical trees when the
+  data, parameters, binary, GPU and driver are unchanged;
+- an explicit VRAM planner that reports the required memory before allocation;
+- lower peak host memory after dense 4-bit and sparse datasets finish construction.
+
+CPU training and ordinary non-deterministic OpenCL training remain available. This
+fork is useful when an AMD / OpenCL workflow needs reproducible models, clear VRAM
+diagnostics or lower Dataset construction memory. It is not a CUDA replacement and it
+does not provide GPU training beyond VRAM or training beyond host RAM.
+
+## Choosing a mode
+
+| Need | Configuration | Recommendation |
+|---|---|---|
+| No GPU, or the packed GPU representation is larger than VRAM | `device_type="cpu"` | Use the standard CPU learner. The Dataset must fit in RAM. |
+| Highest OpenCL speed; exact repeatability is not required | `device_type="gpu"`, `deterministic=false` | Same ordinary OpenCL path as upstream. Packed features must fit in VRAM. |
+| Reproducible OpenCL training | `device_type="gpu"`, `deterministic=true` | **Primary fork mode.** Packed features must fit in VRAM. |
+| The LightGBM Dataset itself does not fit in RAM | Not supported | Use external partitioning / distributed training. This fork does not stream the authoritative Dataset from disk. |
+
+OpenCL training remains a hybrid learner: LightGBM controls trees on the CPU and
+calculates dense histograms on the GPU. The VRAM planner fails before allocation with
+required and available byte counts. If the packed features do not fit, select CPU or
+reduce the dataset; there is no silent fallback to a slower execution mode.
+
+Python example:
+
+```python
+params = {
+    "device_type": "gpu",
+    "deterministic": True,
+}
+model = lightgbm.train(params, dataset, num_boost_round=500)
+```
+
+The number of boosting iterations does not materially change Dataset or VRAM capacity;
+the same training buffers are reused for every tree.
+
+## Measured performance and capacity
+
+Reference system: Windows, Ryzen 5 7600X (6 cores / 12 threads), 31.38 GiB RAM,
+Radeon RX 480 8 GiB, AMD driver 31.0.21925.1001 / OpenCL 2.0, MSVC 14.52. The tests
+used dense synthetic binary Datasets, 285 features, `max_bin=255`, 64-leaf trees,
+feature fraction 0.8, bagging fraction 0.7 and 12 CPU threads. All trees reached 64
+leaves. Results are medians of three small or two large isolated CLI runs with a warm
+OpenCL kernel cache.
+
+| Dataset | Trees | Mode | Training | Full run from `.bin` | Peak process working set |
+|---|---:|---|---:|---:|---:|
+| 0.9M × 285 | 50 | CPU | 6.12 s | 6.33 s | 0.36 GiB |
+| 0.9M × 285 | 50 | ordinary OpenCL | 2.53 s | 3.13 s | 0.46 GiB |
+| 0.9M × 285 | 50 | deterministic OpenCL | 3.47 s | 4.06 s | 0.46 GiB |
+| 20M × 285 | 3 | CPU | 13.98 s | 18.06 s | 6.28 GiB |
+| 20M × 285 | 3 | ordinary OpenCL | 4.18 s | 10.01 s | 6.80 GiB |
+| 20M × 285 | 3 | deterministic OpenCL | 4.88 s | 10.79 s | 6.80 GiB |
+
+On the 20M × 285 case, deterministic OpenCL planned 5,493 MiB for packed features
+and 558 MiB for GPU working buffers: 6,051 MiB of the fork's conservative 6,144 MiB
+budget. The host Dataset bins occupied 5,436 MiB. This is a measured near-limit case
+for this GPU, not a universal row limit: feature count, bin width, objective, classes,
+sparsity and GPU allocation limits all affect capacity. For orientation, the same
+planner places a dense 300-feature, 255-bin Dataset at roughly 19.5M rows on this
+8-GiB GPU.
+
+Measure the complete pipeline on your own workload.
+
+## Determinism contract
+
+With the same LightGBM binary, OpenCL device, driver, data and parameters,
+`deterministic=true` produces byte-identical trees across repeated runs. Validation
+covered bagging, feature sampling, GOSS, early stopping, Dataset subsets and binary
+Dataset loading. Unsupported OpenCL devices fail with a clear capability error; the
+fork never silently switches deterministic training to floating-point accumulation.
+Repeatability does not imply that its model is identical to a CPU or ordinary OpenCL
+model; those modes use different accumulation arithmetic.
+
+## Build
+
+The normal upstream build and package interfaces are unchanged. A tested integrated
+Windows build is:
+
+```bat
+git clone https://github.com/Lorax121/LightGBM-OpenCL-Deterministic.git
+cd LightGBM-OpenCL-Deterministic
+cmake -S . -B build -G "Visual Studio 18 2026" -A x64 ^
+  -D__INTEGRATE_OPENCL=ON -DBUILD_CPP_TEST=ON -DUSE_MPI=OFF ^
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+cmake --build build --config Release -j 8
+set PATH=%CD%\build\bin\Release;%PATH%
+Release\testlightgbm.exe
+```
+
+The integrated build downloads its pinned Boost and OpenCL dependencies. The first
+GPU fit compiles and caches the OpenCL kernels, so do not use that cold run as a
+performance measurement. See the upstream installation documentation below for other
+platforms and Python / R packaging.
+
 > [!NOTE]
 > This project moved from `Microsoft/LightGBM` to `lightgbm-org/LightGBM` in March 2026.
 > This repository is still the official LightGBM source code, managed by the same maintainers (including the creator of LightGBM).

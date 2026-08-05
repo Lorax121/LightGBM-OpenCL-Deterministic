@@ -1,12 +1,12 @@
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(BOOST_VERSION_DOT "1.74")
+set(BOOST_VERSION_DOT "1.91")
 string(REPLACE "." "_" BOOST_VERSION_UNDERSCORE ${BOOST_VERSION_DOT})
 
 set(OPENCL_HEADER_REPOSITORY "https://github.com/KhronosGroup/OpenCL-Headers.git")
-set(OPENCL_HEADER_TAG "1b2a1850f410aaaaeaa56cead5a179b5aea4918e")
+set(OPENCL_HEADER_TAG "v2026.05.29")
 
 set(OPENCL_LOADER_REPOSITORY "https://github.com/KhronosGroup/OpenCL-ICD-Loader.git")
-set(OPENCL_LOADER_TAG "98ca71fb9f8484f1cd1999f55224bf9e8d18693b")
+set(OPENCL_LOADER_TAG "v2026.05.29")
 
 set(BOOST_REPOSITORY "https://github.com/boostorg/boost.git")
 set(BOOST_TAG "boost-${BOOST_VERSION_DOT}.0")
@@ -84,12 +84,18 @@ if(WIN32)
     #  * MSVC toolchain IDs: not sure...
     #    comments like https://learn.microsoft.com/en-us/answers/questions/769911/visual-studio-2019-build-tools-v143
     #
-    if(${MSVC_VERSION} GREATER 1929)
+    if(${MSVC_VERSION} GREATER 1949)
+      set(MSVC_TOOLCHAIN_ID "145")
+      set(BOOST_MSVC_VERSION "14.5")
+    elseif(${MSVC_VERSION} GREATER 1929)
       set(MSVC_TOOLCHAIN_ID "143")
+      set(BOOST_MSVC_VERSION "14.3")
     elseif(${MSVC_VERSION} GREATER 1919)
       set(MSVC_TOOLCHAIN_ID "142")
+      set(BOOST_MSVC_VERSION "14.2")
     elseif(${MSVC_VERSION} GREATER 1909)
       set(MSVC_TOOLCHAIN_ID "141")
+      set(BOOST_MSVC_VERSION "14.1")
     else()
       message(FATAL_ERROR "Unsupported MSVC version number: ${MSVC_VERSION}")
     endif()
@@ -97,7 +103,6 @@ if(WIN32)
       APPEND
         BOOST_BUILD_BYPRODUCTS
           ${BOOST_LIBRARY}/libboost_filesystem-vc${MSVC_TOOLCHAIN_ID}-mt-x64-${BOOST_VERSION_UNDERSCORE}.lib
-          ${BOOST_LIBRARY}/libboost_system-vc${MSVC_TOOLCHAIN_ID}-mt-x64-${BOOST_VERSION_UNDERSCORE}.lib
           ${BOOST_LIBRARY}/libboost_chrono-vc${MSVC_TOOLCHAIN_ID}-mt-x64-${BOOST_VERSION_UNDERSCORE}.lib
     )
   else()
@@ -105,16 +110,35 @@ if(WIN32)
   endif()
   set(BOOST_BOOTSTRAP "${BOOST_BASE}/source/bootstrap.bat")
   set(BOOST_BUILD "${BOOST_BASE}/source/b2.exe")
-  set(BOOST_FLAGS "")
+  # Register the exact cl.exe, force the 64-bit address model (the CMake
+  # byproducts below use the -x64 tag), and give b2 an explicit vcvarsall.bat
+  # wrapper (VS2017+ keeps vcvarsall.bat outside the MSVC toolset dir).
+  get_filename_component(_msvc_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)   # .../bin/Hostx64/x64
+  get_filename_component(_msvc_dir "${_msvc_dir}" DIRECTORY)            # .../bin/Hostx64
+  get_filename_component(_msvc_dir "${_msvc_dir}" DIRECTORY)            # .../bin
+  get_filename_component(_msvc_toolset_dir "${_msvc_dir}" DIRECTORY)    # .../MSVC/<ver>
+  get_filename_component(_msvc_toolset_version "${_msvc_toolset_dir}" NAME)
+  string(REGEX MATCH "^[0-9]+\\.[0-9]+" _msvc_vcvars_version "${_msvc_toolset_version}")
+  get_filename_component(_msvc_dir "${_msvc_toolset_dir}" DIRECTORY)    # .../MSVC
+  get_filename_component(_msvc_dir "${_msvc_dir}" DIRECTORY)            # .../Tools
+  get_filename_component(_msvc_dir "${_msvc_dir}" DIRECTORY)            # .../VC
+  set(BOOST_CONFIGURE_COMMAND
+      "${PROJECT_SOURCE_DIR}/cmake/prepare_boost.bat"
+      "${BOOST_BASE}/source"
+      "${CMAKE_CXX_COMPILER}"
+      "${_msvc_dir}/Auxiliary/Build/vcvarsall.bat"
+      "${BOOST_MSVC_VERSION}"
+      "${_msvc_vcvars_version}")
+  set(BOOST_ADDRESS_MODEL "address-model=64")
+  unset(BOOST_CXXFLAGS_ARGUMENT)
 else()
   set(BOOST_BOOTSTRAP "${BOOST_BASE}/source/bootstrap.sh")
   set(BOOST_BUILD "${BOOST_BASE}/source/b2")
-  set(BOOST_FLAGS "-fPIC")
+  set(BOOST_CXXFLAGS_ARGUMENT "cxxflags=-fPIC")
   list(
     APPEND
     BOOST_BUILD_BYPRODUCTS
       ${BOOST_LIBRARY}/libboost_filesystem.a
-      ${BOOST_LIBRARY}/libboost_system.a
       ${BOOST_LIBRARY}/libboost_chrono.a
   )
 endif()
@@ -126,28 +150,33 @@ list(
     "libs/any"
     "libs/array"
     "libs/assert"
+    "libs/atomic"
     "libs/bind"
     "libs/chrono"
     "libs/compute"
+    "libs/compat"
     "libs/concept_check"
     "libs/config"
     "libs/container"
     "libs/container_hash"
     "libs/core"
+    "libs/date_time"
+    "libs/describe"
     "libs/detail"
     "libs/filesystem"
     "libs/foreach"
     "libs/format"
     "libs/function"
     "libs/function_types"
+    "libs/functional"
     "libs/fusion"
     "libs/headers"
     "libs/integer"
     "libs/io"
     "libs/iterator"
     "libs/lexical_cast"
-    "libs/math"
     "libs/move"
+    "libs/mp11"
     "libs/mpl"
     "libs/multi_index"
     "libs/numeric/conversion"
@@ -155,12 +184,15 @@ list(
     "libs/predef"
     "libs/preprocessor"
     "libs/property_tree"
+    "libs/proto"
     "libs/range"
     "libs/ratio"
     "libs/serialization"
+    "libs/scope"
     "libs/smart_ptr"
     "libs/static_assert"
     "libs/system"
+    "libs/thread"
     "libs/throw_exception"
     "libs/tuple"
     "libs/typeof"
@@ -168,6 +200,7 @@ list(
     "libs/type_traits"
     "libs/utility"
     "libs/uuid"
+    "libs/variant2"
     "libs/winapi"
     "tools/boost_install"
     "tools/build"
@@ -186,24 +219,26 @@ ExternalProject_Add(
   GIT_TAG ${BOOST_TAG}
   GIT_SUBMODULES ${BOOST_SUBMODULES}
   GIT_SHALLOW ON
+  GIT_CONFIG core.longpaths=true
   UPDATE_COMMAND ""
   PATCH_COMMAND ""
-  CONFIGURE_COMMAND ${BOOST_BOOTSTRAP}
+  CONFIGURE_COMMAND ${BOOST_CONFIGURE_COMMAND}
   BUILD_COMMAND
     ${BOOST_BUILD}
     -sBOOST_ROOT=${BOOST_BASE}/source
+    --user-config=${BOOST_BASE}/source/user-config.jam
     -a
     -q
     -j ${J}
     --with-headers
     --with-chrono
     --with-filesystem
-    --with-system
     link=static
     runtime-link=shared
     variant=release
     threading=multi
-    cxxflags="${BOOST_FLAGS}"
+    ${BOOST_ADDRESS_MODEL}
+    ${BOOST_CXXFLAGS_ARGUMENT}
   INSTALL_COMMAND ""
   # BUILD_BYPRODUCTS is necessary to support 'Ninja' builds.
   # ref:

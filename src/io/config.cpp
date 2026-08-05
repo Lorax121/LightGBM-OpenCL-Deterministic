@@ -408,7 +408,11 @@ void Config::CheckParamConflict(const std::unordered_map<std::string, std::strin
     force_col_wise = true;
     force_row_wise = false;
     if (deterministic) {
-      Log::Warning("Although \"deterministic\" is set, the results ran by GPU may be non-deterministic.");
+      // deterministic=true on OpenCL GPU uses the int64 fixed-point histogram path,
+      // which is reproducible on the same device/driver; no warning is needed.
+      if (gpu_use_dp) {
+        Log::Info("gpu_use_dp is ignored when deterministic=true: the deterministic GPU histogram accumulator is always int64 fixed-point.");
+      }
     }
     if (use_quantized_grad) {
       Log::Warning("Quantized training is not supported by GPU tree learner. Switch to full precision training.");

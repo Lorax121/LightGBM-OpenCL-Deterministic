@@ -326,6 +326,9 @@ class Bin {
   */
   virtual size_t SizesInByte() const = 0;
 
+  /*! \brief Get bytes currently owned by dynamic bin storage */
+  virtual size_t MemoryUsage() const { return SizesInByte(); }
+
   /*! \brief Number of all data */
   virtual data_size_t num_data() const = 0;
 

@@ -517,7 +517,7 @@ class DenseBin : public Bin {
       for (int i = 0; i < len; ++i) {
         data_[i] |= buf_[i];
       }
-      buf_.clear();
+      ReleasePushBuffer();
     }
   }
 
@@ -555,6 +555,9 @@ class DenseBin : public Bin {
         data_[i] = mem_data[i];
       }
     }
+    if (IS_4BIT) {
+      ReleasePushBuffer();
+    }
   }
 
   inline VAL_T data(data_size_t idx) const {
@@ -590,6 +593,9 @@ class DenseBin : public Bin {
         data_[i] = other_bin->data_[used_indices[i]];
       }
     }
+    if (IS_4BIT) {
+      ReleasePushBuffer();
+    }
   }
 
   void SaveBinaryToFile(BinaryWriter* writer) const override {
@@ -600,6 +606,11 @@ class DenseBin : public Bin {
     return VirtualFileWriter::AlignedSize(sizeof(VAL_T) * data_.size());
   }
 
+  size_t MemoryUsage() const override {
+    return sizeof(VAL_T) * data_.capacity() +
+           sizeof(uint8_t) * buf_.capacity();
+  }
+
   DenseBin<VAL_T, IS_4BIT>* Clone() override;
 
   const void* GetColWiseData(uint8_t* bit_type, bool* is_sparse, std::vector<BinIterator*>* bin_iterator, const int num_threads) const override;
@@ -607,6 +618,10 @@ class DenseBin : public Bin {
   const void* GetColWiseData(uint8_t* bit_type, bool* is_sparse, BinIterator** bin_iterator) const override;
 
  private:
+  void ReleasePushBuffer() {
+    std::vector<uint8_t>().swap(buf_);
+  }
+
   data_size_t num_data_;
 #ifdef USE_CUDA
   std::vector<VAL_T, CHAllocator<VAL_T>> data_;
